@@ -9,8 +9,10 @@ import Clarity
 // clarity-bench: GPU cost of Clarity on a real recording, plus before/after PNGs.
 //
 // Per frame, two separate command buffers on the same decoded frame:
-//   baseline   plain YCbCr -> R'G'B' conversion + plain CAS sharpen (what a renderer without Clarity does)
-//   clarity    Clarity conversion (guided chroma, de-ringer, mid-band, flat cleanup) + Clarity CAS (limiter)
+//   baseline   plain bilinear YCbCr -> R'G'B' conversion + the CAS kernel with Clarity's gating off (noise 0, no
+//              limiter, full delta): a stand-in for a renderer's own sharpening pass, not a separate plain-CAS kernel
+//   clarity    Clarity conversion (guided chroma, de-ringer, mid-band, flat cleanup; two pixels per thread) + Clarity
+//              CAS (noise gate, limiter, delta gain). At Auto strength 0 (clean stream) Clarity runs no CAS at all.
 // Times: each kernel runs --batch (10) times back to back in one command buffer; GPU time / batch, at source resolution.
 //
 // usage: clarity-bench CLIP.mp4 [--count N] [--start S] [--mode on|auto] [--bpp X] [--wan] [--8bit]
@@ -126,7 +128,7 @@ while i < count, let sample = output.copyNextSampleBuffer(), let pb = CMSampleBu
     let t0 = try await timed { try engine.encodeConvert($0, y: pl.y, c: pl.c, dst: tex[0], params: plain, variant: ClarityEngine.Variant(guided: false)) }
     let t1 = try await timed { engine.encodeCAS($0, src: tex[0], dst: tex[1], params: casPlain) }
     let t2 = try await timed { try engine.encodeConvert($0, y: pl.y, c: pl.c, dst: tex[2], params: cp, variant: ClarityEngine.variant(for: plan)) }
-    let t3 = try await timed { engine.encodeCAS($0, src: tex[2], dst: tex[3], params: casClarity) }
+    let t3 = plan.casBypass ? 0 : try await timed { engine.encodeCAS($0, src: tex[2], dst: tex[3], params: casClarity) }
     withExtendedLifetime(pl.refs) {}
 
     if i >= 5 {          // the first frames include pipeline warm-up
@@ -136,7 +138,7 @@ while i < count, let sample = output.copyNextSampleBuffer(), let pb = CMSampleBu
         let dir = URL(fileURLWithPath: pngDir)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         writePNG(tex[1], pq: isPQ, to: dir.appendingPathComponent("frame\(i)-off.png"))
-        writePNG(tex[3], pq: isPQ, to: dir.appendingPathComponent("frame\(i)-clarity.png"))
+        writePNG(plan.casBypass ? tex[2] : tex[3], pq: isPQ, to: dir.appendingPathComponent("frame\(i)-clarity.png"))
     }
     i += 1
 }
@@ -144,12 +146,14 @@ while i < count, let sample = output.copyNextSampleBuffer(), let pb = CMSampleBu
 let name = URL(fileURLWithPath: path).lastPathComponent
 print("=== \(name): \(i) frames, \(W)x\(H), \(isPQ ? "HDR (PQ)" : "SDR"), Clarity v\(ClarityVersion.current), mode \(mode), "
       + "bpp \(bpp.map { String(format: "%.2f", $0) } ?? "-"), \(wan ? "WAN" : "LAN") ===")
+print("\(device.name), \(ProcessInfo.processInfo.operatingSystemVersionString), plan: \(plan.summary)")
+print("\(msConv.count) timed frames (first 5 skipped), \(batch) dispatches per command buffer, source resolution, no other load added")
 print("                         p50 ms   p95 ms")
 func row(_ n: String, _ v: [Double]) {
     print(n.padding(toLength: 22, withPad: " ", startingAt: 0) + String(format: "%8.3f %8.3f", percentile(v, 50), percentile(v, 95)))
 }
 row("plain convert", msConvB)
-row("plain CAS", msCasB)
+row("baseline CAS", msCasB)
 row("Clarity convert", msConv)
 row("Clarity CAS", msCAS)
 let extra = (0..<msConv.count).map { (msConv[$0] - msConvB[$0]) + (msCAS[$0] - msCasB[$0]) }

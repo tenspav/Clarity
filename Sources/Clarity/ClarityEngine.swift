@@ -28,6 +28,7 @@ public enum ClarityShaders {
     constant bool clarity_headroom [[function_constant(49)]]; // keep the luma change inside the RGB channel headroom (off: no measured gain)
     constant bool clarity_lazy   [[function_constant(50)]];   // read the radius-2 taps only where they matter (bench: slower)
     constant bool clarity_h16    [[function_constant(51)]];   // bench: scaled-half structure tensor instead of float
+    constant bool clarity_seam   [[function_constant(52)]];   // v1.0: source-luma step suppressor arbitrated with Stages 3-4
 
     // 128 bytes. First 8 floats = the plain YCbCr -> RGB parameters (YUVCoefficients).
     struct ClarityYUVParams {
@@ -40,7 +41,9 @@ public enum ClarityShaders {
         float deringT;        // 8
         float guideMaxHigh;   // v0.2: cap at high edge confidence (= guideMax: v0.1)
         float gFine; float gMid; float cap; float rangeT;   // v0.2 mid-band
-        float flatClean; float pad0; float pad1; float pad2;
+        float flatClean;
+        float seamStrength;   // v1.0: step suppressor strength (the former pad0; 0 = off)
+        float pad1; float pad2;
         float4 hud0; float4 hud1;                            // HUD rectangles (x0, y0, x1, y1), stream pixels
     };
 
@@ -256,8 +259,30 @@ public enum ClarityShaders {
                     clarity_ld(t, c + int2(-2, 2), mx, K), clarity_ld(t, c + int2(2, 2), mx, K));
     }
 
+    // v1.0 step suppressor, one ordered adjacent pair (P, Q) on the normal (toward +x or +y): A before P, B after Q,
+    // (Pm, Qm) / (Pp, Qp) the endpoints one pixel away on each side along the edge. Original decoded luma, code steps,
+    // FP32. Returns (g, d): P receives +d, Q -d. Both endpoint invocations evaluate the same ordered pair. Mirrors
+    // ClarityMath.seamPair.
+    inline float2 clarity_seam_pair(float A, float P, float Q, float B, float Pm, float Qm, float Pp, float Qp, float s) {
+        float4 t0 = float4(A, P, Q, B), t1 = float4(Pm, Qm, Pp, Qp);
+        if (any(t0 < 64.0f) || any(t0 > 940.0f) || any(t1 < 64.0f) || any(t1 > 940.0f) || s <= 0.0f) return float2(0.0f);
+        float u = P - A, v = B - Q, j = Q - P;
+        float side = max(max(max(fabs(u), fabs(v)), max(fabs(Pm - P), fabs(Pp - P))), max(fabs(Qm - Q), fabs(Qp - Q)));
+        float drift = max(fabs((Qm - Pm) - j), fabs((Qp - Pp) - j));
+        float sj = sign(j);
+        float excess = sj * clamp(sj * (j - 0.5f * (u + v)), 0.0f, fabs(j));
+        float c = smoothstep(2.0f, 3.0f, fabs(excess)) * (1.0f - smoothstep(9.0f, 14.0f, fabs(j)))
+                * (1.0f - smoothstep(1.25f, 3.0f, side)) * (1.0f - smoothstep(1.0f, 3.0f, drift))
+                * smoothstep(64.0f, 80.0f, min(P, Q)) * (1.0f - smoothstep(700.0f, 820.0f, max(P, Q)));
+        float g = s * c;
+        return float2(g, clamp(0.375f * g * excess, -2.5f, 2.5f));
+    }
+
     // Luma stage read from the texture (direct and reference kernels). The 3x3 comes first; with clarity_lazy the
     // radius-2 taps are read only where they can change the result (clarity_needs_r2), else they stand at the centre.
+    // v1.0 (clarity_seam): all 13 taps are read; the v0.3 result yV03 is arbitrated with the step suppressor:
+    // Yout = clamp(Y + (1 - gSeam) (yV03 - Y) + dSeam, max(64, lo3x3), min(940, hi3x3)); a centre outside the legal
+    // range or inside a known HUD rectangle keeps its original luma (all luma stages).
     inline float clarity_luma_tex(texture2d<float> yT, int2 c, int2 mx, float K, float Yc, constant ClarityYUVParams &p,
                                   thread float4 &dbg) {
         float4 a1 = float4(clarity_ld(yT, c + int2(0, -1), mx, K), clarity_ld(yT, c + int2(0, 1), mx, K),
@@ -265,17 +290,58 @@ public enum ClarityShaders {
         float yD = Yc;
         if (clarity_dering && p.deringStrength > 0.0) yD = clarity_dering_core(Yc, a1.x, a1.y, a1.w, a1.z, p);
         dbg = float4(yD - Yc, 0.0, 0.0, 0.0);
+        float4 d1 = float4(Yc), a2 = float4(Yc);
+        if (clarity_mid || clarity_seam) {
+            d1 = float4(clarity_ld(yT, c + int2(-1, -1), mx, K), clarity_ld(yT, c + int2(1, -1), mx, K),
+                        clarity_ld(yT, c + int2(-1, 1), mx, K), clarity_ld(yT, c + int2(1, 1), mx, K));
+        }
+        if (clarity_seam) {
+            a2 = float4(clarity_ld(yT, c + int2(0, -2), mx, K), clarity_ld(yT, c + int2(0, 2), mx, K),
+                        clarity_ld(yT, c + int2(-2, 0), mx, K), clarity_ld(yT, c + int2(2, 0), mx, K));
+        }
         if (clarity_mid) {
-            float4 d1 = float4(clarity_ld(yT, c + int2(-1, -1), mx, K), clarity_ld(yT, c + int2(1, -1), mx, K),
-                               clarity_ld(yT, c + int2(-1, 1), mx, K), clarity_ld(yT, c + int2(1, 1), mx, K));
             ClarityMB3 m = clarity_midband3(Yc, a1, d1, float2(c), p);
-            float4 a2 = float4(Yc), k1 = float4(Yc), k2 = float4(Yc), k3 = float4(Yc);
-            if (!clarity_lazy || clarity_needs_r2(m)) {
+            float4 k1 = float4(Yc), k2 = float4(Yc), k3 = float4(Yc);
+            if (!clarity_seam && (!clarity_lazy || clarity_needs_r2(m))) {
                 a2 = float4(clarity_ld(yT, c + int2(0, -2), mx, K), clarity_ld(yT, c + int2(0, 2), mx, K),
                             clarity_ld(yT, c + int2(-2, 0), mx, K), clarity_ld(yT, c + int2(2, 0), mx, K));
                 if (clarity_wide) clarity_wide_taps(yT, c, mx, K, k1, k2, k3);
             }
             yD = clarity_midband(yD, Yc, m, a2, k1, k2, k3, p, dbg);
+        }
+        if (clarity_seam) {
+            float2 pos = float2(c);
+            bool hud = clarity_in(pos, p.hud0) || clarity_in(pos, p.hud1);
+            if (Yc < 64.0f || Yc > 940.0f || hud) {
+                if (clarity_deltas) dbg = float4(0.0f);
+                return Yc;
+            }
+            float s = p.seamStrength;
+            float N = a1.x, S = a1.y, W = a1.z, E = a1.w, NW = d1.x, NE = d1.y, SW = d1.z, SE = d1.w;
+            float NN = a2.x, SS = a2.y, WW = a2.z, EE = a2.w;
+            // Pair validity: inside the plane (no clamped taps) and the other endpoint outside known HUD rects.
+            float vl = (c.x >= 2 && c.x + 1 <= mx.x && c.y >= 1 && c.y + 1 <= mx.y) ? 1.0f : 0.0f;
+            float vr = (c.x >= 1 && c.x + 2 <= mx.x && c.y >= 1 && c.y + 1 <= mx.y) ? 1.0f : 0.0f;
+            float vu = (c.y >= 2 && c.y + 1 <= mx.y && c.x >= 1 && c.x + 1 <= mx.x) ? 1.0f : 0.0f;
+            float vd = (c.y >= 1 && c.y + 2 <= mx.y && c.x >= 1 && c.x + 1 <= mx.x) ? 1.0f : 0.0f;
+            if (p.hud0.z > p.hud0.x || p.hud1.z > p.hud1.x) {
+                if (clarity_in(pos + float2(-1, 0), p.hud0) || clarity_in(pos + float2(-1, 0), p.hud1)) vl = 0.0f;
+                if (clarity_in(pos + float2(1, 0), p.hud0) || clarity_in(pos + float2(1, 0), p.hud1)) vr = 0.0f;
+                if (clarity_in(pos + float2(0, -1), p.hud0) || clarity_in(pos + float2(0, -1), p.hud1)) vu = 0.0f;
+                if (clarity_in(pos + float2(0, 1), p.hud0) || clarity_in(pos + float2(0, 1), p.hud1)) vd = 0.0f;
+            }
+            float2 l = clarity_seam_pair(WW, W, Yc, E, NW, N, SW, S, s * vl);
+            float2 r = clarity_seam_pair(W, Yc, E, EE, N, NE, S, SE, s * vr);
+            float2 u = clarity_seam_pair(NN, N, Yc, S, NW, W, NE, E, s * vu);
+            float2 d = clarity_seam_pair(N, Yc, S, SS, W, SW, E, SE, s * vd);
+            float g = max(max(l.x, r.x), max(u.x, d.x));
+            float dS = clamp(-l.y + r.y - u.y + d.y, -2.5f, 2.5f);
+            float lo = min(Yc, min(min(min(N, S), min(W, E)), min(min(NW, NE), min(SW, SE))));
+            float hi = max(Yc, max(max(max(N, S), max(W, E)), max(max(NW, NE), max(SW, SE))));
+            float d03 = yD - Yc;
+            float yOut = clamp(Yc + (1.0f - g) * d03 + dS, max(64.0f, lo), min(940.0f, hi));
+            if (clarity_deltas) dbg = float4(g, dS, yOut - Yc, d03);
+            return yOut;
         }
         return yD;
     }
@@ -327,11 +393,88 @@ public enum ClarityShaders {
         float2 C = clarity_chroma(yT, cT, gid, Yc, p);
         float yD = Yc;
         float4 dbg = float4(0.0);
-        if (clarity_dering || clarity_mid) {
+        if (clarity_dering || clarity_mid || clarity_seam) {
             int2 mx = int2(yT.get_width(), yT.get_height()) - 1;
             yD = clarity_luma_tex(yT, int2(gid), mx, K, Yc, p, dbg);
         }
         clarity_out(dst, gid, yD / K, Yc / K, C, p, dbg);
+    }
+
+    // v1.0 speed form of clarity_yuv_rgb: one thread converts two horizontally adjacent pixels (2i, 2i + 1) with the
+    // same per-pixel math. The two 13-tap luma crosses share 18 reads instead of 26, and with a co-sited chroma column
+    // (siting.x == 0: Left, TopLeft, BottomLeft, the PS5's) both pixels have the same chroma footprint, so the 2 gathers
+    // and the 4 guide-luma samples are fetched once. Same output as clarity_yuv_rgb (bench self-check: bit-identical).
+    // Not for the step suppressor, the 5x5 B2 or lazy reads (they keep the one-pixel kernel).
+    inline void clarity_chroma_pair(texture2d<float> yT, texture2d<float> cT, uint2 g0, float YcA, float YcB,
+                                    constant ClarityYUVParams &p, thread float2 &CA, thread float2 &CB) {
+        const float K = p.codeScale;
+        constexpr sampler ps(coord::pixel, filter::linear, address::clamp_to_edge);
+        float2 uA = (float2(g0) - p.siting) * 0.5, uB = (float2(g0 + uint2(1, 0)) - p.siting) * 0.5;
+        float2 fl = floor(uA);
+        float2 fA = uA - fl, fB = uB - floor(uB);
+        float4 gb = cT.gather(ps, fl + 1.0, int2(0), component::x);
+        float4 gr = cT.gather(ps, fl + 1.0, int2(0), component::y);
+        float2 C00 = float2(gb.w, gr.w), C10 = float2(gb.z, gr.z), C01 = float2(gb.x, gr.x), C11 = float2(gb.y, gr.y);
+        float4 bA = float4((1.0 - fA.x) * (1.0 - fA.y), fA.x * (1.0 - fA.y), (1.0 - fA.x) * fA.y, fA.x * fA.y);
+        float4 bB = float4((1.0 - fB.x) * (1.0 - fB.y), fB.x * (1.0 - fB.y), (1.0 - fB.x) * fB.y, fB.x * fB.y);
+        CA = bA.x * C00 + bA.y * C10 + bA.z * C01 + bA.w * C11;
+        CB = bB.x * C00 + bB.y * C10 + bB.z * C01 + bB.w * C11;
+        if (clarity_guided) {
+            int2 cmax = int2(cT.get_width(), cT.get_height()) - 1;
+            float2 j0 = float2(clamp(int2(fl), int2(0), cmax)), j1 = float2(clamp(int2(fl) + 1, int2(0), cmax));
+            float2 s0 = j0 * 2.0 + p.siting + 0.5, s1 = j1 * 2.0 + p.siting + 0.5;
+            float4 L = float4(yT.sample(ps, s0).r, yT.sample(ps, float2(s1.x, s0.y)).r,
+                              yT.sample(ps, float2(s0.x, s1.y)).r, yT.sample(ps, s1).r) * K;
+            CA = clarity_guide(C00, C10, C01, C11, L, bA, YcA, p);
+            CB = clarity_guide(C00, C10, C01, C11, L, bB, YcB, p);
+        }
+    }
+
+    kernel void clarity_yuv_rgb_x2(texture2d<float> yT [[texture(0)]],
+                                   texture2d<float> cT [[texture(1)]],
+                                   texture2d<float, access::write> dst [[texture(2)]],
+                                   constant ClarityYUVParams &p [[buffer(0)]],
+                                   uint2 tid [[thread_position_in_grid]]) {
+        uint w = dst.get_width(), h = dst.get_height();
+        uint2 g0 = uint2(tid.x * 2, tid.y);
+        if (g0.x >= w || g0.y >= h) return;
+        bool hasB = g0.x + 1 < w;
+        const float K = p.codeScale;
+        int2 c = int2(g0), mx = int2(yT.get_width(), yT.get_height()) - 1;
+        // Row r, columns x0 + k: rm2 = (0, 1), rm1 = (-1 ... 2), r0 = (-2 ... 3), rp1 = (-1 ... 2), rp2 = (0, 1).
+        float r0[6];
+        for (int k = 0; k < 6; k++) r0[k] = clarity_ld(yT, c + int2(k - 2, 0), mx, K);
+        float YcA = r0[2], YcB = r0[3];
+        float2 CA, CB;
+        if (p.siting.x == 0.0) {
+            clarity_chroma_pair(yT, cT, g0, YcA, YcB, p, CA, CB);
+        } else {
+            CA = clarity_chroma(yT, cT, g0, YcA, p);
+            CB = hasB ? clarity_chroma(yT, cT, g0 + uint2(1, 0), YcB, p) : CA;
+        }
+        float yA = YcA, yB = YcB;
+        float4 dbgA = float4(0.0), dbgB = float4(0.0);
+        if (clarity_dering || clarity_mid) {
+            float rm1[4], rp1[4], rm2[2], rp2[2];
+            for (int k = 0; k < 4; k++) {
+                rm1[k] = clarity_ld(yT, c + int2(k - 1, -1), mx, K);
+                rp1[k] = clarity_ld(yT, c + int2(k - 1, 1), mx, K);
+            }
+            for (int k = 0; k < 2; k++) {
+                rm2[k] = clarity_ld(yT, c + int2(k, -2), mx, K);
+                rp2[k] = clarity_ld(yT, c + int2(k, 2), mx, K);
+            }
+            float4 kk = float4(YcA);
+            yA = clarity_luma(YcA, float4(rm1[1], rp1[1], r0[1], r0[3]), float4(rm1[0], rm1[2], rp1[0], rp1[2]),
+                              float4(rm2[0], rp2[0], r0[0], r0[4]), kk, kk, kk, float2(c), p, dbgA);
+            if (hasB) {
+                float4 kb = float4(YcB);
+                yB = clarity_luma(YcB, float4(rm1[2], rp1[2], r0[2], r0[4]), float4(rm1[1], rm1[3], rp1[1], rp1[3]),
+                                  float4(rm2[1], rp2[1], r0[1], r0[5]), kb, kb, kb, float2(c + int2(1, 0)), p, dbgB);
+            }
+        }
+        clarity_out(dst, g0, yA / K, YcA / K, CA, p, dbgA);
+        if (hasB) clarity_out(dst, g0 + uint2(1, 0), yB / K, YcB / K, CB, p, dbgB);
     }
 
     // A/B form: the 13 luma taps from a 16x16 + 2 px halo threadgroup tile (20x20 FP16 code values = 800 B).
@@ -410,7 +553,7 @@ public enum ClarityShaders {
         }
         float yD = Yc;
         float4 dbg = float4(0.0);
-        if (clarity_dering || clarity_mid) {
+        if (clarity_dering || clarity_mid || clarity_seam) {
             int2 mx = int2(yT.get_width(), yT.get_height()) - 1;
             yD = clarity_luma_tex(yT, int2(gid), mx, K, Yc, p, dbg);
         }
@@ -494,7 +637,8 @@ public struct ClarityYUVParams {
     public var siting: SIMD2<Float>
     public var codeScale: Float, invSigmaY: Float, guideMax: Float, deringStrength: Float, deringT: Float, guideMaxHigh: Float
     public var gFine: Float = 0, gMid: Float = 0, cap: Float = 0, rangeT: Float = 16
-    public var flatClean: Float = 0, pad0: Float = 0, pad1: Float = 0, pad2: Float = 0
+    /// v1.0: step suppressor strength (the former pad0 slot: offsets and the 128-byte size are unchanged).
+    public var flatClean: Float = 0, seamStrength: Float = 0, pad1: Float = 0, pad2: Float = 0
     public var hud0 = SIMD4<Float>(repeating: 0), hud1 = SIMD4<Float>(repeating: 0)
 
     public init(_ k: YUVCoefficients, siting: ChromaSiting, tenBit: Bool, deringStrength: Float,
@@ -521,6 +665,7 @@ public struct ClarityYUVParams {
         guideMaxHigh = plan.guideMaxHigh
         gFine = plan.midband.gFine; gMid = plan.midband.gMid; cap = plan.midband.cap; rangeT = plan.midband.rangeT
         flatClean = plan.flatClean
+        seamStrength = plan.seamStrength
         let r = plan.hudRects.map { $0 + SIMD4(-2, -2, 2, 2) }
         hud0 = r.count > 0 ? r[0] : .zero
         hud1 = r.count > 1 ? r[1] : .zero
@@ -583,15 +728,21 @@ public final class ClarityEngine {
         public var lazy = false
         /// Bench: the all-half structure tensor (1/512 scale) instead of the float one. Measured no faster.
         public var halfTensor = false
+        /// v1.0: source-luma step suppressor arbitrated with Stages 3-4 (direct and plain-read kernels; not the tile).
+        public var seam = false
+        /// v1.0: two horizontally adjacent pixels per thread (`clarity_yuv_rgb_x2`, shared taps; same output). Luma-stage
+        /// variants without the step suppressor, the 5x5 B2, lazy reads or the tile.
+        public var pair = false
 
         public init(guided: Bool = true, dering: Bool = false, raw: Bool = false, mid: Bool = false, tensor: Bool = false,
                     linear: Bool = false, tile: Bool = false, wide: Bool = false, perPixel: Bool = false,
                     separate: Bool = false, deltas: Bool = false, headroom: Bool = false, lazy: Bool = false,
-                    halfTensor: Bool = false) {
+                    halfTensor: Bool = false, seam: Bool = false, pair: Bool = false) {
             self.guided = guided; self.dering = dering; self.raw = raw; self.mid = mid; self.tensor = tensor
             self.linear = linear; self.tile = tile; self.wide = wide; self.perPixel = perPixel
             self.separate = separate; self.deltas = deltas; self.headroom = headroom; self.lazy = lazy
-            self.halfTensor = halfTensor
+            self.halfTensor = halfTensor; self.seam = seam
+            self.pair = pair && !seam && !wide && !lazy && !tile && !perPixel && (dering || mid)
         }
     }
 
@@ -606,12 +757,19 @@ public final class ClarityEngine {
     /// Width is always threadExecutionWidth. Bench sweep knob (threadExecutionWidth x 4 / x 8 / max).
     public var convertThreadgroupHeight = 0
 
-    /// The conversion variants a shipped plan can ask for (`variant(for:)`), compiled ahead of the first frame.
+    /// The conversion variants a shipped plan can ask for (`variant(for:)`), compiled ahead of the first frame:
+    /// guided-only (the v1.0 clean route and the fallback), the v0.3 luma stages, and the v1.0 fused stack.
     public static let shippedVariants: [Variant] = [false, true].flatMap { dering in
         [false, true].map { mid in
-            Variant(guided: true, dering: dering, mid: mid, separate: mid)
+            Variant(guided: true, dering: dering, mid: mid, separate: mid, pair: true)
         }
-    }
+    } + [Variant(guided: true, dering: true, mid: true, separate: true, seam: true)]
+
+    /// v1.0: shipped luma-stage conversions use the paired kernel. Bench A/B switch only.
+    nonisolated(unsafe) public static var usePairKernel = true
+
+    /// The v1.0 bypass / fallback conversion: guided chroma, no luma stage.
+    public static let guidedOnly = Variant(guided: true)
 
     public init(device: MTLDevice, library: MTLLibrary? = nil) throws {
         self.device = device
@@ -631,19 +789,46 @@ public final class ClarityEngine {
         }
     }
 
+    /// v1.0 render-path lookup: the pipeline if it is already compiled, else nil (never compiles on the caller's
+    /// thread). A missing variant is compiled once in the background; the caller uses a ready fallback meanwhile.
+    public func readyPSO(_ v: Variant) -> MTLComputePipelineState? {
+        let (p, start): (MTLComputePipelineState?, Bool) = psoLock.withLock {
+            if let p = convertPSOs[v] { return (p, false) }
+            return (nil, pending.insert(v).inserted)
+        }
+        if start {
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in _ = try? self?.convertPSO(v) }
+        }
+        return p
+    }
+    private var pending = Set<Variant>()
+    /// Pipelines of `clarity_yuv_rgb_x2` (half-width grid).
+    private var pairPSOs = Set<ObjectIdentifier>()
+
+    /// Dispatch of a conversion pipeline: one thread per pixel, or per horizontal pixel pair for `clarity_yuv_rgb_x2`.
+    private func dispatchConvert(_ enc: MTLComputeCommandEncoder, _ pso: MTLComputePipelineState, _ dst: MTLTexture) {
+        let pair = psoLock.withLock { pairPSOs.contains(ObjectIdentifier(pso)) }
+        let w = pso.threadExecutionWidth, mx = max(1, pso.maxTotalThreadsPerThreadgroup / w)
+        let h = convertThreadgroupHeight > 0 ? min(convertThreadgroupHeight, mx) : mx
+        enc.dispatchThreads(MTLSize(width: pair ? (dst.width + 1) / 2 : dst.width, height: dst.height, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: w, height: h, depth: 1))
+    }
+
     /// Thread-safe. The compile runs outside the lock; two threads asking for the same new variant at once may both
     /// compile it, and the first one stored wins.
     public func convertPSO(_ v: Variant) throws -> MTLComputePipelineState {
         if let p = psoLock.withLock({ convertPSOs[v] }) { return p }
         let cv = MTLFunctionConstantValues()
-        var flags = [v.guided, v.dering, v.raw, v.mid, v.tensor, v.linear, v.wide, v.separate, v.deltas, v.headroom, v.lazy, v.halfTensor]
+        var flags = [v.guided, v.dering, v.raw, v.mid, v.tensor, v.linear, v.wide, v.separate, v.deltas, v.headroom, v.lazy, v.halfTensor,
+                     v.seam && !v.tile]
         for i in flags.indices { cv.setConstantValue(&flags[i], type: .bool, index: 40 + i) }
-        let name = v.perPixel ? "clarity_yuv_rgb_px" : v.tile ? "clarity_yuv_rgb_tile" : "clarity_yuv_rgb"
+        let name = v.perPixel ? "clarity_yuv_rgb_px" : v.tile ? "clarity_yuv_rgb_tile" : v.pair ? "clarity_yuv_rgb_x2" : "clarity_yuv_rgb"
         let fn = try library.makeFunction(name: name, constantValues: cv)
         let p = try device.makeComputePipelineState(function: fn)
         return psoLock.withLock {
             if let q = convertPSOs[v] { return q }
             convertPSOs[v] = p
+            if v.pair { pairPSOs.insert(ObjectIdentifier(p)) }
             return p
         }
     }
@@ -675,13 +860,41 @@ public final class ClarityEngine {
 
     /// The conversion variant a plan needs (production kernel). `lazy`: read the radius-2 taps only where needed
     /// (same output; bench A/B only, slower than the plain reads).
-    public static func variant(for plan: ClarityPlan, lazy: Bool = false) -> Variant {
+    /// `seamQualified`: the frame is on the qualified fused route (`seamQualified(_:)`); the step suppressor then runs
+    /// when the plan asks for it (v1.0, e > 0).
+    public static func variant(for plan: ClarityPlan, lazy: Bool = false, seamQualified: Bool = false) -> Variant {
         let mid = plan.midband.active || plan.flatClean > 0
+        let seam = seamQualified && plan.seamRoute && plan.seamStrength > 0
         // Direct reads: with the 13-tap B2 they are 0.03-0.07 ms faster than the 16x16 tile (the tile only wins with the
         // 25-tap B2, which is not shipped). CLARITY_PROGRESS.md › v0.2-beta.
+        // v1.0: luma-stage variants run two pixels per thread (clarity_yuv_rgb_x2: -0.115 ms at 1080p on M2, output
+        // within float rounding of the one-pixel kernel). `usePairKernel` = false: the one-pixel kernel (bench A/B).
         return Variant(guided: plan.chroma, dering: plan.deringStrength > 0, mid: mid, tile: false, wide: false,
                        separate: mid && plan.separateBands, headroom: (mid || plan.deringStrength > 0) && plan.rgbHeadroom,
-                       lazy: mid && lazy)
+                       lazy: mid && lazy && !seam, seam: seam, pair: usePairKernel)
+    }
+
+    /// v1.0 qualified route for the fused step suppressor (and no legacy RGB deblock): progressive 10-bit
+    /// limited-range 4:2:0 tagged BT.2020 non-constant-luminance matrix AND PQ transfer, each checked on its own.
+    /// Anything else (8-bit, full range, SDR, missing metadata) keeps the legacy path as a unit.
+    public static func seamQualified(_ pb: CVPixelBuffer) -> Bool {
+        guard CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange else { return false }
+        let matrix = CVBufferCopyAttachment(pb, kCVImageBufferYCbCrMatrixKey, nil) as? String
+        let transfer = CVBufferCopyAttachment(pb, kCVImageBufferTransferFunctionKey, nil) as? String
+        return matrix == (kCVImageBufferYCbCrMatrix_ITU_R_2020 as String)
+            && transfer == (kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String)
+    }
+
+    /// Same as `encodeConvert` with a pipeline from `readyPSO` (the render path never compiles).
+    public func encodeConvert(_ enc: MTLComputeCommandEncoder, y: MTLTexture, c: MTLTexture, dst: MTLTexture,
+                              params: ClarityYUVParams, pso: MTLComputePipelineState) {
+        var prm = params
+        enc.setComputePipelineState(pso)
+        enc.setTexture(y, index: 0)
+        enc.setTexture(c, index: 1)
+        enc.setTexture(dst, index: 2)
+        enc.setBytes(&prm, length: MemoryLayout<ClarityYUVParams>.stride, index: 0)
+        dispatchConvert(enc, pso, dst)
     }
 
     /// `dst` has the luma plane's size.
@@ -698,7 +911,7 @@ public final class ClarityEngine {
             enc.dispatchThreadgroups(MTLSize(width: (dst.width + 15) / 16, height: (dst.height + 15) / 16, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
         } else {
-            Self.dispatch(enc, pso, dst, rows: convertThreadgroupHeight)
+            dispatchConvert(enc, pso, dst)
         }
     }
 

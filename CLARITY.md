@@ -2,7 +2,9 @@
 
 Clarity is a compression cleanup and chroma reconstruction engine for Apple silicon, built for the FramePortal PS5 Remote Play app. It makes a 10-45 Mbps 10-bit HEVC HDR stream from the PS5 look closer to the console's own picture, with **no extra frame of latency** and a GPU budget of **1.50 ms p95** (v0.2; v0.1 had 1.0 ms) on a MacBook Air M2, with Motion FrameGen and MetalFX running.
 
-**Current version: Clarity v0.3-beta.** Clarity is versioned separately from the app (like [Motion](https://github.com/tenspav/Motion)). Modes: **Auto / Off / On** (`ClarityMode`).
+**Current version: Clarity v1.0** (final pure-Metal release). Clarity is versioned separately from the app (like [Motion](https://github.com/tenspav/Motion)). Modes: **Auto / Off / On** (`ClarityMode`).
+
+**v1.0** keeps v0.3's stages and adds one smooth Auto strength driven by the received bitrate (1080p first), a reconstruction-only bypass on clean streams, and one frozen plan per Motion output pair. A fused source-luma step suppressor was built and measured but did not beat the existing RGB deblock, so it is off (CLARITY_PROGRESS.md › v1.0).
 
 **Pure-Metal tuning is frozen after v0.3.** The hand-tuned shader stages get bug fixes only; the next quality step is the learned residual (Roadmap in CLARITY_PROGRESS.md).
 
@@ -28,13 +30,15 @@ What Clarity does not do: no film grain, no fixed 8×8 deblocking grid, no AI up
 
 | Mode | Stage 1 (chroma) | Stage 2 (adaptive CAS) | Stage 3 (de-ringer) | Stage 4 (mid-band + flat clean) |
 |---|---|---|---|---|
-| **Auto** (default) | on | on, delta ×0.7, noise limiter scaled by received bitrate | any route, scaled by received bitrate | any route; gains ×(0.5 + 0.5 × eligibility), flat clean × eligibility |
-| **On** | on | on, delta ×0.7, full noise limiter | full strength | full strength, home LAN and away |
+| **Auto** (default) | on | on, delta ×0.7 e, noise limiter × e; none at e = 0 | 0.4 e | gains × e, flat clean × e |
+| **On** | on | on, delta ×0.7, full noise limiter | full strength (e = 1) | full strength, home LAN and away |
 | **Off** | plain bilinear (the pre-Clarity path) | plain CAS | off | off |
 
-"WAN" is any route that is not the home LAN (over the internet). The route picks the Stage 4 preset (below); in v0.2 it no longer switches stages on or off.
+"WAN" is any route that is not the home LAN: over the internet. The route picks the Stage 4 preset (below); in v0.2 it no longer switches stages on or off.
 
-**Auto is calibrated on the received bitrate.** The PS5 delivers about 45-65 % of the requested rate (10.8 Mbps average on a 45 Mbps 1080p request, 0.17 bpp/frame), so v0.2 moves the eligibility ramp up: full at ≤ 0.30 bpp/frame, zero at ≥ 0.70 (v0.1: 0.20 / 0.50). For 1080p30 that is ≤ 18.7 Mbps received for full strength and ≥ 43.5 Mbps for none, so every real 1080p session today runs at or near full strength.
+**Auto (v1.0): one strength e from the received bitrate.** `e = S(0, 1, age) × (1 − S(full, zero, bpp))`, S = smoothstep, bpp = received bits per pixel per frame, age = seconds of bitrate history (warm-in over the first second). 1080p: full at ≤ 0.125 bpp, zero at ≥ 0.30 (7.8 and 18.7 Mbps at 1080p30); 720p and below 0.14 / 0.36. Received LAN rates measured 5-32 Mbps (median about 15), so Auto now spans the real range. At e = 0 the frame gets Stage 1 only (no luma stage, no CAS). The host's RGB deblock runs at every strength. The plan sampled when Motion's made frame is submitted is reused for the real frame that follows it, so a pair never changes strength in the middle.
+
+*v0.2 / v0.3 calibration (history):* The PS5 delivers about 45-65 % of the requested rate (10.8 Mbps average on a 45 Mbps 1080p request, 0.17 bpp/frame), so v0.2 moves the eligibility ramp up: full at ≤ 0.30 bpp/frame, zero at ≥ 0.70 (v0.1: 0.20 / 0.50). For 1080p30 that is ≤ 18.7 Mbps received for full strength and ≥ 43.5 Mbps for none, so every real 1080p session today runs at or near full strength.
 
 ## Architecture
 
@@ -62,7 +66,7 @@ PS5 HEVC 10-bit ──► VideoToolbox ──► x420 planes (Y 16-bit unorm, Cb
    present: PQ decode, EDR tone map, deband (existing)
 ```
 
-- Real frames and Motion-made frames go through the same conversion pass, so the same plan (and de-ringer strength) applies to both.
+- Real frames and Motion-made frames go through the same conversion pass. Since v1.0 the plan is frozen per output pair (made frame, then real frame) by `ClarityCohortLatch`; the renderer looks pipelines up ready-only (`readyPSO`) and falls back to guided-only + legacy deblock while a variant compiles.
 - Clarity adds **no pass and no texture**. Stages 1, 3 and 4 replace the body of the existing conversion kernel. Stage 2 replaces the body of the existing CAS taps, with **zero new texture reads**.
 - Stages 3 and 4 change only the luma that is displayed. The decoder's planes are read-only, so Motion's optical flow still sees the original luma.
 
@@ -70,13 +74,15 @@ PS5 HEVC 10-bit ──► VideoToolbox ──► x420 planes (Y 16-bit unorm, Cb
 
 | File | What |
 |---|---|
-| `Sources/Clarity/ClarityVersion.swift` | `ClarityVersion.current = "0.2-beta"` |
+| `Sources/Clarity/ClarityVersion.swift` | `ClarityVersion.current = "1.0"` |
 | `Sources/Clarity/ClarityCore.swift` | Mode, chroma siting, bitrate meter, mid-band presets, plan, `ClarityController`, CPU reference math |
 | `Sources/Clarity/ClarityEngine.swift` | Metal source (`ClarityShaders.source`) and `ClarityEngine` |
 | `Sources/Clarity/YUVCoefficients.swift` | YCbCr → R'G'B' matrix and range coefficients |
 | `Sources/clarity-bench/main.swift` | Standalone GPU-cost bench with before / after PNGs |
 
 The Metal source has its own include, `clarity_` names and function constants 40-51 (40 guided, 41 dering, 42 raw, 43 mid-band, 44 structure tensor (bench only), 45 linear FP16 output (bench only), 46 wide B2 (bench only), 47 v0.3 band separation, 48 luma-stage deltas output (bench only), 49 R'G'B' headroom bound (off), 50 lazy radius-2 reads (bench only), 51 all-half structure tensor (bench only)). It is prepended to the renderer's shader source, so both live in one library. `ClarityEngine` builds its pipelines behind a lock and compiles the shipped variants on a background thread at start (`prewarm`).
+
+The Metal source has its own include, `clarity_` names and function constants 40-51 (40 guided, 41 dering, 42 raw, 43 mid-band, 44 structure tensor (bench only), 45 linear FP16 output (bench only), 46 wide B2 (bench only), 47 v0.3 band separation, 48 luma-stage deltas output (bench only), 49 R'G'B' headroom bound (off), 50 lazy radius-2 reads (bench only), 51 all-half structure tensor (bench only), 52 v1.0 source-luma step suppressor (not shipped)). It is prepended to the renderer's shader source, so both live in one library. `ClarityEngine` builds its pipelines behind a lock and compiles the shipped variants on a background thread at start (`prewarm`).
 
 ## Shader math
 
@@ -250,6 +256,8 @@ All under the 1.50 ms p95 gate in the v0.2 runs.
 
 **v0.3-beta costs the same as v0.2.** Paired per frame in the same run, the v0.3 conversion is +0.002 to +0.019 ms p50 against the v0.2 conversion at 1080p and −0.001 to +0.003 ms at 720p; the CAS kernel is the same. On a quiet machine (the first of three repeats) 1080p 18.6 Mbps with Motion measured 0.87 / 1.15 ms for the v0.2 build and 0.97 / 1.35 ms for v0.3's total. With background load (the other two repeats) both builds measured 1.4 / 1.8-2.4 ms, over the gate together. Full tables: CLARITY_PROGRESS.md › v0.3-beta. The conversion pass is most of it (Stage 4: about +0.6 ms at 1080p); the CAS limiter adds nothing measurable (+0.00 ms vs v0.1 CAS). Without Motion the GPU runs at a lower clock, so every kernel, legacy included, is slower; the gate is set with Motion running, as in a real session.
 
+**v1.0** runs v0.3's stages with scaled gains, converting two pixels per thread (`clarity_yuv_rgb_x2`, shared taps and chroma fetches; −0.115 ms on the conversion, output within float rounding). Quiet M2, release build, Motion load, 2560×1440: full strength adds about 0.76 ms p50 and 0.9-1.0 ms on the chain p95 over Off, inside the 1.50 ms p95 gate; a clean 25 Mbps stream (e = 0) adds nothing. Tables: CLARITY_PROGRESS.md › v1.0.
+
 ## Verification
 
 This repo:
@@ -258,9 +266,9 @@ This repo:
 swift run -c release clarity-bench CLIP.mp4 [--count N] [--mode on|auto] [--bpp X] [--wan] [--png DIR --frame K]
 ```
 
-It times the plain conversion + CAS against Clarity's (10 back-to-back dispatches per command buffer, at the source resolution) and writes before / after PNGs of one frame.
+It times a plain bilinear conversion + the CAS kernel with Clarity's gating off (the baseline) against Clarity's conversion + CAS (10 back-to-back dispatches per command buffer, at the source resolution; the first 5 frames are skipped), prints the device, OS and plan, and writes before / after PNGs of one frame. It does not run an upscaler, Motion or a present pass: those host-side numbers (below and in CLARITY_PROGRESS.md) come from FramePortal's in-app bench.
 
-The quality numbers in [CLARITY_PROGRESS.md](CLARITY_PROGRESS.md) come from FramePortal's in-app bench (`--bench-clarity CLIP --v02`), which also runs Motion, MetalFX and the whole render chain. Its columns: Off, v0.1, v0.2, v0.2 + structure tensor, v0.2 at the spec's 13-tap gains, and an "alt" variant. Quality is Y PSNR against the original-bitrate decode over all, textured (3×3 span 6-48 codes) and flat pixels, the 5×5-band detail energy and its correlation with the reference on textured pixels, and the added frame-to-frame flicker.
+The quality numbers in [CLARITY_PROGRESS.md](CLARITY_PROGRESS.md) come from FramePortal's in-app bench (`--bench-clarity CLIP --v02`, and `--v10` for v1.0: self-check, seam / ramp / stroke gates, live renderer-path timing, paired vs one-pixel kernel), which also runs Motion, MetalFX and the whole render chain. Its columns: Off, v0.1, v0.2, v0.2 + structure tensor, v0.2 at the spec's 13-tap gains, and an "alt" variant. Quality is Y PSNR against the original-bitrate decode over all, textured (3×3 span 6-48 codes) and flat pixels, the 5×5-band detail energy and its correlation with the reference on textured pixels, and the added frame-to-frame flicker.
 
 - Self-check: the GPU kernel against a plain-read reference kernel (`Variant(perPixel: true)`) and against the CPU reference (`ClarityMath`) for all six sitings.
 - Chroma quality: a 4:4:4 reference with known full chroma, made from the clip (960×540 and 480×270), re-subsampled with each siting and rebuilt. CbCr PSNR.

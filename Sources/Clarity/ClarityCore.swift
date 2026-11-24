@@ -96,10 +96,39 @@ public enum ClarityTuning {
     /// Normalised sample -> 10-bit code steps: 16-bit-unorm-backed x420 (10 bits in the top of 16) or 8-bit planes.
     public static func codeScale(tenBit: Bool) -> Float { tenBit ? 65535.0 / 64.0 : 255.0 * 4.0 }
 
-    /// 1 at or below 0.30 bpp/frame, linear down to 0 at 0.70.
+    /// 1 at or below 0.30 bpp/frame, linear down to 0 at 0.70 (v0.1-v0.3 plans, bench A/B).
     public static func eligibility(bpp: Double) -> Float {
         guard bpp.isFinite else { return 0 }
         return Float(min(1, max(0, (bppZero - bpp) / (bppZero - bppFull))))
+    }
+
+    /// v1.0 Auto anchors, received bits per pixel per frame: full strength at or below `full`, exactly zero at or
+    /// above `zero`, smoothstep in between. 1080p: 0.125 / 0.30 = 7.78 / 18.66 Mbps at 30 source FPS (twice that at
+    /// 60). 720p and below: 0.14 / 0.36 = 3.87 / 9.95 Mbps at 720p30.
+    public static func autoAnchors(height: Int) -> (full: Double, zero: Double) {
+        height < 1000 ? (0.14, 0.36) : (0.125, 0.30)
+    }
+
+    /// v1.0 Auto strength e in [0, 1]: `S(0, 1, age) * (1 - S(full, zero, bpp))`. `age`: seconds of accepted
+    /// bitrate samples since the estimator started (warm-in, so a startup keyframe does not toggle every stage).
+    /// Unknown or invalid estimate: 0 (clean, reconstruction-only route).
+    public static func autoStrength(bpp: Double?, height: Int, age: Double) -> Float {
+        guard let bpp, bpp.isFinite, bpp >= 0, !age.isNaN, age > 0 else { return 0 }
+        let a = autoAnchors(height: height)
+        let ramp = age == .infinity ? 1 : smooth(0, 1, age)
+        return Float(ramp * (1 - smooth(a.full, a.zero, bpp)))
+    }
+
+    /// v1.0 qualification result for the fused source-luma step suppressor (rank 1): it did NOT beat the legacy RGB
+    /// deblock on flat dark map / menu seams (no-reference seam metric J on 8-grid pairs: 1.29-1.38 codes RMS vs 0.49
+    /// for v0.3 + legacy deblock; no visible win in the crops), so it ships off and the legacy deblock stays on at
+    /// every rate (CLARITY_PROGRESS.md › v1.0). The kernel, CPU oracle and bench A/B remain for a later candidate.
+    public static let seamShipped = false
+
+    /// Smoothstep S(a, b, v) = t^2 (3 - 2t), t = saturate((v - a) / (b - a)).
+    public static func smooth(_ a: Double, _ b: Double, _ v: Double) -> Double {
+        let t = min(1, max(0, (v - a) / (b - a)))
+        return t * t * (3 - 2 * t)
     }
 }
 
@@ -110,19 +139,29 @@ public struct ClarityBitrateMeter: Sendable {
     public let tau: Double
     private var bytesPerFrame: Double?
     private var lastT: Double?
+    /// v1.0: seconds of accepted samples since the first valid one (each interval capped at 0.5 s), for the Auto
+    /// warm-in. Reset together with the average.
+    public private(set) var elapsed: Double = 0
 
     public init(tau: Double = ClarityTuning.smoothingSeconds) { self.tau = tau }
 
-    public mutating func reset() { bytesPerFrame = nil; lastT = nil }
+    public mutating func reset() { bytesPerFrame = nil; lastT = nil; elapsed = 0 }
 
-    /// `t`: arrival time in seconds (any monotonic clock).
-    public mutating func add(frameBytes: Int, at t: Double) {
-        let b = Double(max(0, frameBytes))
-        guard let v = bytesPerFrame, let l = lastT else { bytesPerFrame = b; lastT = t; return }
-        let dt = min(max(t - l, 0), 0.5)               // a stall does not wipe the history in one step
+    /// `t`: arrival time in seconds (any monotonic clock). v1.0: non-finite or backward times and non-positive sizes
+    /// are rejected (returns false); an equal time is accepted with no weight. A stall (gap) moves the average by at
+    /// most one 0.5 s step.
+    @discardableResult
+    public mutating func add(frameBytes: Int, at t: Double) -> Bool {
+        guard t.isFinite, frameBytes > 0 else { return false }
+        let b = Double(frameBytes)
+        guard let v = bytesPerFrame, let l = lastT else { bytesPerFrame = b; lastT = t; return true }
+        guard t >= l else { return false }
+        let dt = min(t - l, 0.5)                        // a stall does not wipe the history in one step
         let a = 1 - exp(-dt / max(tau, 1e-3))
         bytesPerFrame = v + a * (b - v)
         lastT = t
+        elapsed += dt
+        return true
     }
 
     /// Bits per pixel per frame for a `width` x `height` stream; nil before the first frame.
@@ -212,6 +251,16 @@ public struct ClarityPlan: Equatable, Sendable {
     public var guideMaxHigh: Float
     /// HUD / minimap rectangles in stream pixels (x0, y0, x1, y1), at most 2: no mid-band change inside them.
     public var hudRects: [SIMD4<Float>]
+    /// v1.0: Auto strength e (0 = clean stream, reconstruction only; 1 = full cleanup). On = 1. Informational: the
+    /// stage amounts below are already scaled by it.
+    public var strength: Float = 0
+    /// v1.0 plan (built by `make`): the summary carries e.
+    public var v1 = false
+    /// v1.0: the renderer may use the fused source-luma step suppressor in place of its legacy RGB deblock on
+    /// qualified frames (10-bit limited-range BT.2020 PQ). Off while `ClarityTuning.seamShipped` is false.
+    public var seamRoute = false
+    /// v1.0: strength of the source-luma step suppressor (= e on the qualified fused path), 0 = off.
+    public var seamStrength: Float = 0
 
     public static let off = ClarityPlan(chroma: false, adaptiveCAS: false, casNoise: 0, deringStrength: 0)
 
@@ -225,8 +274,11 @@ public struct ClarityPlan: Equatable, Sendable {
     }
 
     public var enabled: Bool { chroma || adaptiveCAS || deringStrength > 0 || midband.active || flatClean > 0 }
-    /// The conversion pass runs the luma stage (de-ringer, mid-band, flat cleanup).
-    public var lumaStage: Bool { deringStrength > 0 || midband.active || flatClean > 0 }
+    /// The conversion pass runs the luma stage (de-ringer, mid-band, flat cleanup, v1.0 step suppressor).
+    public var lumaStage: Bool { deringStrength > 0 || midband.active || flatClean > 0 || seamStrength > 0 }
+    /// v1.0: the adaptive CAS has nothing to do (correction gain 0): the renderer skips it entirely (no plain CAS
+    /// either), so Auto at e = 0 is reconstruction only.
+    public var casBypass: Bool { adaptiveCAS && correctionGain <= 0 }
 
     /// `wan`: the route crosses the internet (not the home LAN). `bpp`: smoothed RECEIVED bits per pixel per frame,
     /// nil while unknown. `height`: stream height (below 1080p the 720p mid-band preset applies).
@@ -235,7 +287,39 @@ public struct ClarityPlan: Equatable, Sendable {
     /// - On: every stage at full strength, home LAN and away, whatever the bitrate.
     /// - v0.3: the CAS gain acts on the bounded luma delta (`correctionGain`) and Stage 4 separates flat cleanup from
     ///   detail. The R'G'B' headroom bound (`rgbHeadroom`) is off: no measurable effect on the clips, +0.01-0.08 ms.
-    public static func make(mode: ClarityMode, wan: Bool, bpp: Double?, height: Int = 1080) -> ClarityPlan {
+    /// v1.0 plan. One strength e drives every adaptive stage (CLARITY.md › Auto):
+    /// - Auto: e = S(0, 1, age) x (1 - S(full, zero, bpp)) with the 1080p / 720p anchors of
+    ///   `ClarityTuning.autoAnchors`; 0 while the received rate is unknown. On: e = 1. Off: the host's legacy path.
+    /// - de-ringer 0.4 e, flat cleanup e, mid-band preset gains x e (cap and threshold kept), CAS noise gate e, CAS
+    ///   correction gain 0.7 e on the bounded delta, step suppressor e. Guided chroma always (Auto and On).
+    /// - e = 0 is exact: no luma stage, no CAS, and (on a qualified frame) no legacy deblock.
+    /// `age`: seconds of valid bitrate samples (warm-in); the default (infinity) skips the warm-in.
+    public static func make(mode: ClarityMode, wan: Bool, bpp: Double?, height: Int = 1080, age: Double = .infinity) -> ClarityPlan {
+        guard mode != .off else { return .off }
+        let e: Float = mode == .on ? 1 : ClarityTuning.autoStrength(bpp: bpp, height: height, age: age)
+        let mb = ClarityMidband.preset(wan: wan, height: height).scaled(e)
+        var p = ClarityPlan(chroma: true, adaptiveCAS: true, casNoise: e, deringStrength: ClarityTuning.deringStrength * e,
+                            midband: e > 0 ? mb : .off, flatClean: e, casGain: 1, casLimiter: true, guideMaxHigh: ClarityTuning.guideMaxHigh,
+                            correctionGain: ClarityTuning.casGainWithMidband * e, separateBands: true, rgbHeadroom: false)
+        p.strength = e
+        p.v1 = true
+        p.seamRoute = ClarityTuning.seamShipped
+        p.seamStrength = ClarityTuning.seamShipped ? e : 0
+        return p
+    }
+
+    /// The plan with the fused step suppressor route on at its own strength (bench A/B of the rank 1 candidate).
+    public var withSeamCandidate: ClarityPlan {
+        var p = self
+        guard p.enabled else { return p }
+        p.seamRoute = true
+        p.seamStrength = p.strength
+        return p
+    }
+
+    /// The v0.3-beta plan (bench A/B and the qualified fallback reference): v0.2's taper with the CAS gain on the
+    /// luma delta and separated bands; no step suppressor, legacy deblock stays on.
+    public static func v03(mode: ClarityMode, wan: Bool, bpp: Double?, height: Int = 1080) -> ClarityPlan {
         var p = v02(mode: mode, wan: wan, bpp: bpp, height: height)
         guard p.enabled else { return p }
         p.correctionGain = p.casGain
@@ -264,13 +348,51 @@ public struct ClarityPlan: Equatable, Sendable {
         return ClarityPlan(chroma: true, adaptiveCAS: true, casNoise: bpp.map(e) ?? 0, deringStrength: dering)
     }
 
-    /// One log line: "chroma on, CAS noise 0.42 x1.00 delta x0.70, dering 0.17, mid 0.55/0.08 cap 5, clean 0.42, sep, headroom".
+    /// One log line: "e 0.81, chroma on, CAS noise 0.42 x1.00 delta x0.70, dering 0.17, mid 0.55/0.08 cap 5, clean 0.42, sep, seam 0.81".
     public var summary: String {
         guard enabled else { return "off" }
-        return String(format: "chroma %@, CAS noise %.2f x%.2f delta x%.2f, dering %.2f, mid %.2f/%.2f cap %.0f, clean %.2f%@%@",
+        return String(format: "%@chroma %@, CAS noise %.2f x%.2f delta x%.2f, dering %.2f, mid %.2f/%.2f cap %.0f, clean %.2f%@%@%@",
+                      v1 ? String(format: "e %.2f, ", strength) : "",
                       chroma ? "on" : "off", adaptiveCAS ? casNoise : 0, casGain, correctionGain, deringStrength,
-                      midband.gMid, midband.gFine, midband.cap, flatClean, separateBands ? ", sep" : "", rgbHeadroom ? ", headroom" : "")
+                      midband.gMid, midband.gFine, midband.cap, flatClean, separateBands ? ", sep" : "", rgbHeadroom ? ", headroom" : "",
+                      seamRoute ? String(format: ", seam %.2f", seamStrength) : "")
     }
+}
+
+/// v1.0: one frozen Clarity plan per Motion output cohort. The app presents made(A, B) and then real B: both use the
+/// plan sampled when the made frame was submitted, so real and made frames never differ in strength (no 30 Hz pulse
+/// from a plan update landing between them). A frame with no open made frame (native 30, a repeat at a cut, a late
+/// made frame dropped) samples its own. Redraws look their frame up by pts and keep its plan.
+public struct ClarityCohortLatch: Sendable {
+    private var openMade: ClarityPlan?
+    private var recent: [(pts: UInt64, plan: ClarityPlan)] = []
+    public static let depth = 8
+
+    public init() {}
+
+    /// Records the plan of a submitted frame and returns it. `live`: the controller's current plan.
+    @discardableResult
+    public mutating func submit(pts: UInt64, made: Bool, live: () -> ClarityPlan) -> ClarityPlan {
+        let p: ClarityPlan
+        if made {
+            p = live()
+            openMade = p
+        } else if let m = openMade {
+            p = m
+            openMade = nil
+        } else {
+            p = live()
+        }
+        recent.removeAll { $0.pts == pts }
+        recent.append((pts, p))
+        if recent.count > Self.depth { recent.removeFirst(recent.count - Self.depth) }
+        return p
+    }
+
+    /// The plan frozen for the frame with this pts, nil if it was never submitted (or is too old).
+    public func plan(pts: UInt64) -> ClarityPlan? { recent.last { $0.pts == pts }?.plan }
+
+    public mutating func reset() { openMade = nil; recent.removeAll() }
 }
 
 /// Session glue, thread-safe: the network thread feeds video access unit sizes, the render queue asks for the plan
@@ -299,6 +421,9 @@ public final class ClarityController: @unchecked Sendable {
 
     public var bpp: Double? { lock.withLock { meter.bpp(width: width, height: height) } }
 
+    /// Stream size the bitrate is normalised by (begin, then the decoded size via `setDimensions`).
+    public var dimensions: (width: Int, height: Int) { lock.withLock { (width, height) } }
+
     /// HUD / minimap rectangles (stream pixels) kept out of the mid-band enhancer; empty = none known.
     public var hudRects: [SIMD4<Float>] {
         get { lock.withLock { _hud } }
@@ -306,11 +431,23 @@ public final class ClarityController: @unchecked Sendable {
     }
     private var _hud: [SIMD4<Float>] = []
 
+    /// v1.0 plan (with the Auto warm-in on the accepted bitrate samples).
     public var plan: ClarityPlan {
         lock.withLock {
-            var p = ClarityPlan.make(mode: _mode, wan: wan, bpp: meter.bpp(width: width, height: height), height: height)
+            var p = ClarityPlan.make(mode: _mode, wan: wan, bpp: meter.bpp(width: width, height: height), height: height, age: meter.elapsed)
             if p.enabled { p.hudRects = _hud }
             return p
+        }
+    }
+
+    /// Decoded stream size changed (new generation): the bitrate history and the warm-in start again. The renderer
+    /// calls it from `StreamRenderer.submit` whenever the decoded frame size differs from the last one it saw (stream
+    /// start and any mid-session resolution change, Mac and iOS).
+    public func setDimensions(width: Int, height: Int) {
+        guard width > 0, height > 0 else { return }
+        lock.withLock {
+            guard width != self.width || height != self.height else { return }
+            self.width = width; self.height = height; meter.reset()
         }
     }
 }
@@ -465,6 +602,57 @@ extension ClarityMath {
             aDetail = min(max(gain * band, -mb.cap), mb.cap)
         }
         return (min(max(yIn + aFlat + aDetail, lo), hi), aFlat, aDetail, gain)
+    }
+
+    // MARK: v1.0 source-luma step suppressor (CLARITY.md › Step suppressor)
+
+    /// Legal limited-range 10-bit luma codes.
+    public static let legalLo: Float = 64, legalHi: Float = 940
+
+    /// One ordered adjacent pair (P, Q) on the normal, oriented toward +x or +y: A just before P, B just after Q,
+    /// (pm, qm) / (pp, qp) the same endpoints one pixel away on each side along the edge. Returns the gain g and the
+    /// correction d (P receives +d, Q receives -d). Symmetric: both endpoints evaluate the same ordered pair.
+    /// Phase independent (no coding-grid position). A pair with any tap outside 64...940 is skipped.
+    public static func seamPair(a: Float, p: Float, q: Float, b: Float, pm: Float, qm: Float, pp: Float, qp: Float,
+                                strength: Float = 1) -> (g: Float, d: Float) {
+        for v in [a, p, q, b, pm, qm, pp, qp] where !(v >= legalLo && v <= legalHi) { return (0, 0) }
+        func S(_ lo: Float, _ hi: Float, _ v: Float) -> Float { smoothstep(lo, hi, v) }
+        let u = p - a, v = b - q, j = q - p
+        let jm = qm - pm, jp = qp - pp
+        let side = max(abs(u), abs(v), abs(pm - p), abs(pp - p), abs(qm - q), abs(qp - q))
+        let drift = max(abs(jm - j), abs(jp - j))
+        let sj: Float = j > 0 ? 1 : (j < 0 ? -1 : 0)
+        let excess = sj * min(max(sj * (j - 0.5 * (u + v)), 0), abs(j))
+        let c = S(2, 3, abs(excess)) * (1 - S(9, 14, abs(j))) * (1 - S(1.25, 3, side)) * (1 - S(1, 3, drift))
+            * S(64, 80, min(p, q)) * (1 - S(700, 820, max(p, q)))
+        let g = min(max(strength, 0), 1) * c
+        return (g, min(max(0.375 * g * excess, -2.5), 2.5))
+    }
+
+    /// The four pairs of pixel Y from its 13 taps (`t.a1` = N, S, W, E; `t.d1` = NW, NE, SW, SE; `t.a2` = NN, SS, WW,
+    /// EE). `valid` = (left, right, up, down): the pair lies inside the plane and outside known HUD rectangles.
+    /// Returns max g and the sum of the signed corrections clamped once to +-2.5 codes.
+    public static func seam(_ t: MidbandTaps, strength: Float, valid: SIMD4<Float> = SIMD4(repeating: 1)) -> (g: Float, d: Float) {
+        let Y = t.y, (N, S, W, E) = (t.a1.x, t.a1.y, t.a1.z, t.a1.w), (NW, NE, SW, SE) = (t.d1.x, t.d1.y, t.d1.z, t.d1.w)
+        let (NN, SS, WW, EE) = (t.a2.x, t.a2.y, t.a2.z, t.a2.w)
+        let l = seamPair(a: WW, p: W, q: Y, b: E, pm: NW, qm: N, pp: SW, qp: S, strength: strength * valid.x)
+        let r = seamPair(a: W, p: Y, q: E, b: EE, pm: N, qm: NE, pp: S, qp: SE, strength: strength * valid.y)
+        let u = seamPair(a: NN, p: N, q: Y, b: S, pm: NW, qm: W, pp: NE, qp: E, strength: strength * valid.z)
+        let d = seamPair(a: N, p: Y, q: S, b: SS, pm: W, qm: SW, pp: E, qp: SE, strength: strength * valid.w)
+        let g = max(max(l.g, r.g), max(u.g, d.g))
+        return (g, min(max(-l.d + r.d - u.d + d.d, -2.5), 2.5))
+    }
+
+    /// v1.0 luma of one pixel: the v0.3 luma `yV03` (de-ringer + Stage 4) arbitrated with the step suppressor.
+    /// `Yout = clamp(Y + (1 - g) (yV03 - Y) + dSeam, max(64, lo3x3), min(940, hi3x3))`; a centre outside the legal
+    /// range or inside a known HUD rectangle keeps its original luma.
+    public static func seamLuma(yV03: Float, _ t: MidbandTaps, strength: Float, valid: SIMD4<Float> = SIMD4(repeating: 1),
+                                hud: Bool = false) -> Float {
+        let Y = t.y
+        guard Y >= legalLo, Y <= legalHi, !hud else { return Y }
+        let s = seam(t, strength: strength, valid: valid)
+        let lo = min(Y, min(t.a1.min(), t.d1.min())), hi = max(Y, max(t.a1.max(), t.d1.max()))
+        return min(max(Y + (1 - s.g) * (yV03 - Y) + s.d, max(legalLo, lo)), min(legalHi, hi))
     }
 
     /// v0.3 channel headroom: the normalised luma change `dy` added to R'G'B' `base`, kept inside [-min, 1 - max]

@@ -1,0 +1,660 @@
+°
+\
+lumaDFP16 Y prime, normalized narrow range. Packed channels: TL TR BL BR.*
+ú¿êÄRU
+delta<Signed normalized residual. Clamp and apply in the renderer.*
+ú¿êÄ¢Ë
+=Signed residual only. Input nominal HDR luma (code10-64)/876.¢:
++com.github.apple.coremltools.source_dialectTorchScript¢-
+$com.github.apple.coremltools.version8.3.0¢9
+#com.github.apple.coremltools.sourcetorch==2.5.1+cu121≤¡,Ã*
+main√*
+(
+luma 
+
+
+
+
+ú
+¿CoreML6ç*
+CoreML6Å*deltaj
+const
+input_1_pad_type_0
+*(
+name 
+
+"
+input_1_pad_type_0*
+val
+
+
+"
+customn
+const
+input_1_pad_0
+
+
+*#
+name
+
+"
+input_1_pad_0*!
+val
+
+
+
+
+
+t
+const!
+input_1_strides_0
+
+
+*'
+name
+
+"
+input_1_strides_0*
+val
+
+
+
+
+x
+const#
+input_1_dilations_0
+
+
+*)
+name!
+
+"
+input_1_dilations_0*
+val
+
+
+
+
+a
+const
+input_1_groups_0
+*&
+name
+
+"
+input_1_groups_0*
+val
+
+
+∏
+const6
+net_0_weight_to_fp16
+
+
+
+
+
+**
+name"
+
+"
+net_0_weight_to_fp16*K
+valD
+
+
+
+
+
+*"
+@model_path/weights/weight.bin@ë
+const"
+net_0_bias_to_fp16
+
+
+
+*(
+name 
+
+"
+net_0_bias_to_fp16*:
+val3
+
+
+
+*#
+@model_path/weights/weight.binÄ
+ﬂ
+conv
+x
+
+luma
+pad
+
+input_1_pad_0
+bias
+
+net_0_bias_to_fp16 
+strides
+
+input_1_strides_0"
+weight
+
+net_0_weight_to_fp16$
+	dilations
+
+input_1_dilations_0
+groups
+
+input_1_groups_0"
+pad_type
+
+input_1_pad_type_05
+input_1_cast_fp16 
+
+
+
+
+ú
+¿*'
+name
+
+"
+input_1_cast_fp16Ç
+relu
+x
+
+input_1_cast_fp165
+input_3_cast_fp16 
+
+
+
+
+ú
+¿*'
+name
+
+"
+input_3_cast_fp16j
+const
+input_5_pad_type_0
+*(
+name 
+
+"
+input_5_pad_type_0*
+val
+
+
+"
+customn
+const
+input_5_pad_0
+
+
+*#
+name
+
+"
+input_5_pad_0*!
+val
+
+
+
+
+
+t
+const!
+input_5_strides_0
+
+
+*'
+name
+
+"
+input_5_strides_0*
+val
+
+
+
+
+x
+const#
+input_5_dilations_0
+
+
+*)
+name!
+
+"
+input_5_dilations_0*
+val
+
+
+
+
+a
+const
+input_5_groups_0
+*&
+name
+
+"
+input_5_groups_0*
+val
+
+
+π
+const6
+net_2_weight_to_fp16
+
+
+
+
+
+**
+name"
+
+"
+net_2_weight_to_fp16*L
+valE
+
+
+
+
+
+*#
+@model_path/weights/weight.binÄë
+const"
+net_2_bias_to_fp16
+
+
+
+*(
+name 
+
+"
+net_2_bias_to_fp16*:
+val3
+
+
+
+*#
+@model_path/weights/weight.bin¿/Ï
+conv
+x
+
+input_3_cast_fp16
+pad
+
+input_5_pad_0
+bias
+
+net_2_bias_to_fp16 
+strides
+
+input_5_strides_0"
+weight
+
+net_2_weight_to_fp16$
+	dilations
+
+input_5_dilations_0
+groups
+
+input_5_groups_0"
+pad_type
+
+input_5_pad_type_05
+input_5_cast_fp16 
+
+
+
+
+ú
+¿*'
+name
+
+"
+input_5_cast_fp16Ç
+relu
+x
+
+input_5_cast_fp165
+input_7_cast_fp16 
+
+
+
+
+ú
+¿*'
+name
+
+"
+input_7_cast_fp16j
+const
+input_9_pad_type_0
+*(
+name 
+
+"
+input_9_pad_type_0*
+val
+
+
+"
+customn
+const
+input_9_pad_0
+
+
+*#
+name
+
+"
+input_9_pad_0*!
+val
+
+
+
+
+
+t
+const!
+input_9_strides_0
+
+
+*'
+name
+
+"
+input_9_strides_0*
+val
+
+
+
+
+x
+const#
+input_9_dilations_0
+
+
+*)
+name!
+
+"
+input_9_dilations_0*
+val
+
+
+
+
+a
+const
+input_9_groups_0
+*&
+name
+
+"
+input_9_groups_0*
+val
+
+
+π
+const6
+net_4_weight_to_fp16
+
+
+
+
+
+**
+name"
+
+"
+net_4_weight_to_fp16*L
+valE
+
+
+
+
+
+*#
+@model_path/weights/weight.bin¿0ë
+const"
+net_4_bias_to_fp16
+
+
+
+*(
+name 
+
+"
+net_4_bias_to_fp16*:
+val3
+
+
+
+*#
+@model_path/weights/weight.binÄUÏ
+conv
+x
+
+input_7_cast_fp16
+pad
+
+input_9_pad_0
+bias
+
+net_4_bias_to_fp16 
+strides
+
+input_9_strides_0"
+weight
+
+net_4_weight_to_fp16$
+	dilations
+
+input_9_dilations_0
+groups
+
+input_9_groups_0"
+pad_type
+
+input_9_pad_type_05
+input_9_cast_fp16 
+
+
+
+
+ú
+¿*'
+name
+
+"
+input_9_cast_fp16~
+relu
+x
+
+input_9_cast_fp163
+input_cast_fp16 
+
+
+
+
+ú
+¿*%
+name
+
+"
+input_cast_fp16g
+const
+var_41_pad_type_0
+*&
+name
+
+"
+op_41_pad_type_0*
+val
+
+
+"
+customk
+const
+var_41_pad_0
+
+
+*!
+name
+
+"
+op_41_pad_0*!
+val
+
+
+
+
+
+q
+const 
+var_41_strides_0
+
+
+*%
+name
+
+"
+op_41_strides_0*
+val
+
+
+
+
+u
+const"
+var_41_dilations_0
+
+
+*'
+name
+
+"
+op_41_dilations_0*
+val
+
+
+
+
+^
+const
+var_41_groups_0
+*$
+name
+
+"
+op_41_groups_0*
+val
+
+
+π
+const6
+net_6_weight_to_fp16
+
+
+
+
+
+**
+name"
+
+"
+net_6_weight_to_fp16*L
+valE
+
+
+
+
+
+*#
+@model_path/weights/weight.binÄV|
+const"
+net_6_bias_to_fp16
+
+
+
+*(
+name 
+
+"
+net_6_bias_to_fp16*%
+val
+
+
+
+
+:
+
+¯Ñh@ûÖ◊
+conv
+x
+
+input_cast_fp16
+pad
+
+var_41_pad_0
+bias
+
+net_6_bias_to_fp16
+strides
+
+var_41_strides_0"
+weight
+
+net_6_weight_to_fp16#
+	dilations
+
+var_41_dilations_0
+groups
+
+var_41_groups_0!
+pad_type
+
+var_41_pad_type_0)
+delta 
+
+
+
+
+ú
+¿*%
+name
+
+"
+op_41_cast_fp16"Ì
+	buildInfoﬂ"
+
+
+Ã"…
+8
+!
+
+"
+coremltools-version
+
+	"
+8.3.0
+F
+)
+!
+"
+coremltools-component-torch
+
+"
+2.5.1+cu121
+E
+(
+ 
+"
+coremltools-source-dialect
+
+"
+TorchScript

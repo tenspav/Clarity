@@ -36,6 +36,58 @@ How the numbers are measured (FramePortal's in-app `--bench-clarity` bench; [cla
 
 ---
 
+## v0.4-beta experiment: learned ANE luma residual (not shipped)
+
+A tiny 1× luma residual network on the Neural Engine that replaces Stages 3 and 4. Trained offline, exported to Core ML FP16, timed on the M2 through a zero-copy IOSurface bridge. **It fails the ship gate, so it is not part of the Clarity engine (this branch only).** Models: `models/clarity-v04/`. Training and validation code: `tools/clarity-v04-train/`. M2 bench: `tools/clarity-ane-bench/`.
+
+**Ship gate (set before testing):** at least +0.3 dB Y PSNR over v0.3 on average, no clip worse, identity residual ≤0.3 code RMS on clean input, and at most 1.5 ms extra at 1080p p95 under load.
+
+**Data.** Four 4K HDR gameplay recordings (AV1 10-bit, BT.2020 / PQ, limited range; two at 30 fps and two at 59.94 fps, normalised to 30 fps). The strata are scaled to duration: 45 strata per 42-60 min video and 100 on the 4 h drive. Each stratum has 3 bursts, and each burst keeps 8 frames, including 3 true adjacent pairs.
+- Size: 693 bursts, **5,544 scenes**, 95 GB of uint16 arrays.
+- Split per video: train is the middle 90 % of each video, val is the last ~10 % of strata, with one skipped guard stratum before val. Train has 627 bursts, val 66 per resolution and variant.
+- Targets: Spline36 4K → 1080p and 720p in Y′CbCr (zscale), synthetic HUD on ~44 % of the bursts.
+- Inputs are HEVC Main10 low-delay P (GOP 30/60/120) in two variants:
+  - x265 superfast ABR at 10-22 Mb/s (1080p) and 4-10 Mb/s (720p);
+  - NVENC p4/ll CBR at an independent rate draw (in place of the spec's x265 CRF variant, to fit the CPU budget).
+- Checks: observed/requested rate p50 1.02-1.04, 0 picture-type mismatches, 0 duplicate pairs, 0 alignment failures, clipping below 0.003 %.
+
+**Training.** AdamW with 500 warm-up steps to 3e-4, then cosine to 3e-5. 36 epochs × 750 steps, FP16 autocast, patch 128 plus a 16 px halo, identity batch every 8th step. Each model ran ~35 min on one GPU at ~14-20 steps/s (data-loader bound).
+- **Packed16 never learned** from the spec's zero-initialised last layer: final weights ~0.001 and output 0.04 code. Lower LR, another seed, FP32 and a head-only warm-up did not fix it either.
+- It was retrained from a function-preserving warm start out of the trained Packed8: Packed16 starts as exactly Packed8 (max diff 0.0), then trains 36 epochs.
+
+| Model (params) | val loss ep 1 → 36 | Y PSNR vs no-op, 1080p / 720p | **vs v0.3 luma, 1080p / 720p** | edge PSNR vs v0.3 | flicker Δ vs v0.3 | identity RMS / p99 (gate ≤0.3 / ≤1) | phase probes |
+|---|---|---|---|---|---|---|---|
+| Packed8 (1,172) | 3.114 → 3.066 | +0.059 / +0.036 dB | **+0.10 / +0.03 dB** | +0.04 / +0.02 dB | −0.07 / −0.03 code | 0.51-0.57 / 1.9-2.1 code: fail | pass |
+| Packed16 warm start (5,812) | 3.124 → 3.053 | +0.166 / +0.121 dB | **+0.21 / +0.11 dB** | — | — | 0.76-0.85 / 2.6-2.8 code: fail | pass |
+| Unpacked8 (737) | 3.108 → 3.011 | +0.149 / +0.106 dB | **+0.19 / +0.10 dB** | +0.09 / +0.05 dB | −0.14 / −0.10 code | 0.87-1.03 / 3.3-4.0 code: fail | pass |
+
+The v0.3 column is a NumPy port of `ClarityMath.dering` + `midbandDeltas` (v0.3 Auto plan, home LAN, received bpp per clip), not the Metal shader: `v03_luma.py`. The shader matches the CPU reference by `--selfcheck`. On this val set v0.3's luma stage alone scores −0.04 dB (1080p) and +0.01 dB (720p) against the decoded input. All gains are larger on the x265 variant than on NVENC (Packed8 at 1080p: +0.15 vs +0.05 dB over v0.3).
+
+**M2 timing.** Pack, then prediction, through preallocated `OneComponent16Half` IOSurfaces (`MLMultiArray(pixelBuffer:)` + `outputBackings`, with the output surface identity checked). 1,000 warmed calls each. `MLComputePlan` (`.cpuAndNeuralEngine`) places every conv and ReLU on the ANE in all 8 packages. Core ML output matches PyTorch within 0.04-0.06 code RMS (max 0.33), and signed deltas survive, including the FP16 grayscale image path. "Under load" means a concurrent 256 MB GPU blit loop: the ANE shares memory bandwidth, so prediction is about 1.8× slower.
+
+| Total pack + predict, p50 / p95 / p99 (ms) | 1080p idle | 1080p under load | 720p idle | 720p under load |
+|---|---|---|---|---|
+| Packed8 | 1.02 / 1.29 / 1.92 | 1.89 / **2.56** / 3.49 | 0.63 / 0.71 / 0.91 | 1.12 / 1.47 / 1.98 |
+| Packed16 | 2.06 / 2.62 / 3.22 | 3.67 / **4.07** / 4.63 | 1.08 / 1.61 / 2.57 | 1.85 / 2.88 / 3.41 |
+| Unpacked8 (tensor) | 2.75 / 3.12 / 3.50 | 4.95 / **5.76** / 7.74 | 1.36 / 1.54 / 1.92 | 2.74 / 3.74 / 4.79 |
+| Unpacked8 (image) | 2.74 / 3.24 / 3.69 | 4.92 / 5.67 / 6.73 | 1.38 / 1.87 / 2.44 | 2.54 / 3.55 / 4.24 |
+
+The GPU pack kernel itself is 0.03-0.18 ms p50. Under the "never wait" contract the residual is only usable when it is ready before the conversion pass that consumes the frame. Ready within 2 / 3 / 4 ms under load at 1080p: Packed8 66 / 98 / 99 %, Packed16 0 / 1 / 92 %, Unpacked8 0 / 0 / 0 %.
+
+**Verdict: fail, not integrated.**
+- **Quality:** the best average gain over v0.3 is +0.16 dB (Packed16; Unpacked8 +0.15 dB). The gate is +0.3 dB.
+- **Identity:** every model changes clean input by 0.5-1.0 code RMS. The gate is ≤0.3. One identity batch in eight does not teach the net to leave clean frames alone.
+- **Timing:** only Packed8 at 720p stays under 1.5 ms p95 under load. At 1080p Packed8 is 2.56 ms.
+- **Not done:** the five-clip `clarity-bench` A/B against the real Metal v0.3 path. It needs the model wired into the bench, and the gate already fails on identity and timing.
+
+Next, if resumed:
+- add clean-input pairs at a higher rate, or a bitrate input, to fix identity;
+- train Packed8 at 720p only;
+- try W8A8 on A19 Pro for bandwidth;
+- if one passes, run the real `clarity-bench` A/B.
+
+---
+
 ## v0.3-beta: audit fixes, CAS delta gain, band separation (last pure-Metal pass)
 
 Source: an independent audit of v0.2. One focused pass; after it the hand-tuned Metal stages are frozen (bug fixes only). Bench: FramePortal's in-app `--bench-clarity CLIP --v02` (v0.3 columns).

@@ -1,0 +1,18 @@
+PLAN ClarityLuma1x-Packed16-1080.mlmodelc: ios16.conv@ANE×4 ios16.relu@ANE×3 ane_only=true
+TIME ClarityLuma1x-Packed16-1080.mlmodelc 1920x1080 n=1000
+  predict    p50 1.674 p95 2.002 p99 2.569 max 2.834
+  total      p50 2.057 p95 2.621 p99 3.216 max 5.519
+  ready-by   2.0ms:5.6% 3.0ms:98.3% 4.0ms:99.8% 5.0ms:99.9% 7.0ms:100.0% 8.0ms:100.0% 10.0ms:100.0% 16.7ms:100.0%
+TIME ClarityLuma1x-Packed16-1080.mlmodelc 1920x1080 +gpuload n=1000
+  predict    p50 3.112 p95 3.383 p99 3.617 max 7.154
+  total      p50 3.674 p95 4.071 p99 4.627 max 7.664
+  ready-by   2.0ms:0.0% 3.0ms:1.0% 4.0ms:92.0% 5.0ms:99.4% 7.0ms:99.9% 8.0ms:100.0% 10.0ms:100.0% 16.7ms:100.0%
+PLAN ClarityLuma1x-Packed16-720.mlmodelc: ios16.conv@ANE×4 ios16.relu@ANE×3 ane_only=true
+TIME ClarityLuma1x-Packed16-720.mlmodelc 1280x720 n=1000
+  predict    p50 0.816 p95 1.217 p99 1.661 max 11.777
+  total      p50 1.079 p95 1.613 p99 2.573 max 20.933
+  ready-by   2.0ms:98.1% 3.0ms:99.5% 4.0ms:99.5% 5.0ms:99.7% 7.0ms:99.8% 8.0ms:99.8% 10.0ms:99.8% 16.7ms:99.9%
+TIME ClarityLuma1x-Packed16-720.mlmodelc 1280x720 +gpuload n=1000
+  predict    p50 1.350 p95 2.337 p99 2.549 max 3.765
+  total      p50 1.848 p95 2.884 p99 3.413 max 5.638
+  ready-by   2.0ms:61.2% 3.0ms:97.3% 4.0ms:99.6% 5.0ms:99.8% 7.0ms:100.0% 8.0ms:100.0% 10.0ms:100.0% 16.7ms:100.0%

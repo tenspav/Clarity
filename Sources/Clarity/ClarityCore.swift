@@ -1,5 +1,6 @@
 import Foundation
 import CoreVideo
+import simd
 
 // Clarity: compression cleanup and chroma reconstruction for the decoded stream (see CLARITY.md).
 // This file is the pure, testable part: the user setting, chroma siting, the bitrate meter and the per-frame plan.
@@ -76,7 +77,9 @@ public enum ClarityTuning {
     /// v0.2: cap where the edge confidence is high (score 0.75 -> 1 ramps the cap from `guideMax` to this). Tried at 0.85
     /// and 1.0: chroma PSNR lower on every clip (CLARITY_PROGRESS.md), so it ships equal to `guideMax`.
     public static let guideMaxHigh: Float = 0.65
-    /// v0.2: post-upscale CAS gain while the mid-band enhancer runs (no double boost).
+    /// Post-upscale CAS gain while the mid-band enhancer runs (no double boost). v0.2 multiplied the sharpness amount
+    /// by it (which only lowered the CAS lobe to about 97 %); from v0.3 it is `ClarityPlan.correctionGain`, applied to
+    /// the bounded luma delta itself.
     public static let casGainWithMidband: Float = 0.7
     /// De-ringer threshold, 10-bit code steps.
     public static let deringT: Float = 8
@@ -195,8 +198,14 @@ public struct ClarityPlan: Equatable, Sendable {
     public var midband: ClarityMidband
     /// v0.2: flat-area / shadow block cleanup amount, 0 ... 1 (at most 1.5 code steps).
     public var flatClean: Float
-    /// v0.2: multiplier on the post-upscale CAS amount (lower while the mid-band enhancer runs).
+    /// v0.2: multiplier on the post-upscale CAS sharpness amount (1 from v0.3; kept for the v0.2 A/B plan).
     public var casGain: Float
+    /// v0.3: multiplier on the CAS's bounded luma delta (lower while the mid-band enhancer runs; 0 = no CAS).
+    public var correctionGain: Float
+    /// v0.3: the texture weight picks between flat cleanup and detail instead of adding both (Stage 4).
+    public var separateBands: Bool
+    /// v0.3: the luma change stays inside the R'G'B' channel headroom of in-gamut pixels (no one-channel clip).
+    public var rgbHeadroom: Bool
     /// v0.2: RCAS-style 5-tap noise limiter in the CAS.
     public var casLimiter: Bool
     /// v0.2: guided-chroma cap where the edge confidence is high (= ClarityTuning.guideMax: v0.1 behaviour).
@@ -208,13 +217,14 @@ public struct ClarityPlan: Equatable, Sendable {
 
     public init(chroma: Bool, adaptiveCAS: Bool, casNoise: Float, deringStrength: Float, midband: ClarityMidband = .off,
                 flatClean: Float = 0, casGain: Float = 1, casLimiter: Bool = false, guideMaxHigh: Float = ClarityTuning.guideMax,
-                hudRects: [SIMD4<Float>] = []) {
+                hudRects: [SIMD4<Float>] = [], correctionGain: Float = 1, separateBands: Bool = false, rgbHeadroom: Bool = false) {
         self.chroma = chroma; self.adaptiveCAS = adaptiveCAS; self.casNoise = casNoise; self.deringStrength = deringStrength
         self.midband = midband; self.flatClean = flatClean; self.casGain = casGain; self.casLimiter = casLimiter
         self.guideMaxHigh = guideMaxHigh; self.hudRects = hudRects
+        self.correctionGain = correctionGain; self.separateBands = separateBands; self.rgbHeadroom = rgbHeadroom
     }
 
-    public var enabled: Bool { chroma || adaptiveCAS || deringStrength > 0 || midband.active }
+    public var enabled: Bool { chroma || adaptiveCAS || deringStrength > 0 || midband.active || flatClean > 0 }
     /// The conversion pass runs the luma stage (de-ringer, mid-band, flat cleanup).
     public var lumaStage: Bool { deringStrength > 0 || midband.active || flatClean > 0 }
 
@@ -223,7 +233,20 @@ public struct ClarityPlan: Equatable, Sendable {
     /// - Auto: every stage; luma cleanup (de-ringer, flat cleanup, CAS noise gate) scaled by the received-bitrate
     ///   eligibility on any route, mid-band at 50-100 % of its preset (100 % at or below 0.30 bpp).
     /// - On: every stage at full strength, home LAN and away, whatever the bitrate.
+    /// - v0.3: the CAS gain acts on the bounded luma delta (`correctionGain`) and Stage 4 separates flat cleanup from
+    ///   detail. The R'G'B' headroom bound (`rgbHeadroom`) is off: no measurable effect on the clips, +0.01-0.08 ms.
     public static func make(mode: ClarityMode, wan: Bool, bpp: Double?, height: Int = 1080) -> ClarityPlan {
+        var p = v02(mode: mode, wan: wan, bpp: bpp, height: height)
+        guard p.enabled else { return p }
+        p.correctionGain = p.casGain
+        p.casGain = 1
+        p.separateBands = true
+        p.rgbHeadroom = false
+        return p
+    }
+
+    /// The v0.2-beta plan (bench A/B): the CAS gain scales the sharpness amount, flat cleanup and detail add up.
+    public static func v02(mode: ClarityMode, wan: Bool, bpp: Double?, height: Int = 1080) -> ClarityPlan {
         guard mode != .off else { return .off }
         let elig: Float = mode == .on ? 1 : (bpp.map(ClarityTuning.eligibility) ?? 0)
         let mb = ClarityMidband.preset(wan: wan, height: height).scaled(mode == .on ? 1 : 0.5 + 0.5 * elig)
@@ -241,12 +264,12 @@ public struct ClarityPlan: Equatable, Sendable {
         return ClarityPlan(chroma: true, adaptiveCAS: true, casNoise: bpp.map(e) ?? 0, deringStrength: dering)
     }
 
-    /// One log line: "chroma on, CAS noise 0.42 x0.70, dering 0.17, mid 0.55/0.08 cap 5, clean 0.42".
+    /// One log line: "chroma on, CAS noise 0.42 x1.00 delta x0.70, dering 0.17, mid 0.55/0.08 cap 5, clean 0.42, sep, headroom".
     public var summary: String {
         guard enabled else { return "off" }
-        return String(format: "chroma %@, CAS noise %.2f x%.2f, dering %.2f, mid %.2f/%.2f cap %.0f, clean %.2f",
-                      chroma ? "on" : "off", adaptiveCAS ? casNoise : 0, casGain, deringStrength,
-                      midband.gMid, midband.gFine, midband.cap, flatClean)
+        return String(format: "chroma %@, CAS noise %.2f x%.2f delta x%.2f, dering %.2f, mid %.2f/%.2f cap %.0f, clean %.2f%@%@",
+                      chroma ? "on" : "off", adaptiveCAS ? casNoise : 0, casGain, correctionGain, deringStrength,
+                      midband.gMid, midband.gFine, midband.cap, flatClean, separateBands ? ", sep" : "", rgbHeadroom ? ", headroom" : "")
     }
 }
 
@@ -370,11 +393,18 @@ extension ClarityMath {
         }
     }
 
-    /// v0.2 mid-band enhancer + flat cleanup on display luma (CLARITY.md › Mid-band). `yIn`: luma after the
+    /// Mid-band enhancer + flat cleanup on display luma (CLARITY.md › Mid-band). `yIn`: luma after the
     /// de-ringer (or the centre itself); all decisions use the original taps. `hud`: pixel is inside a HUD rectangle.
-    /// `tensor`: structure-tensor direction weights (A/B switch).
+    /// `tensor`: structure-tensor direction weights (A/B switch). `separate`: v0.3 band separation (else v0.2's sum).
     public static func midband(yIn: Float, _ t: MidbandTaps, mb: ClarityMidband, flatClean: Float, hud: Bool = false,
-                               tensor: Bool = false) -> Float {
+                               tensor: Bool = false, separate: Bool = false) -> Float {
+        midbandDeltas(yIn: yIn, t, mb: mb, flatClean: flatClean, hud: hud, tensor: tensor, separate: separate).y
+    }
+
+    /// The mid-band output and its parts as applied, code steps: flat cleanup, detail, and the texture weight w.
+    /// v0.2 (`separate` false): out = yIn + clamp(w band, +-cap) + flat. v0.3: out = yIn + mix(flat, clamp(band, +-cap), w).
+    public static func midbandDeltas(yIn: Float, _ t: MidbandTaps, mb: ClarityMidband, flatClean: Float, hud: Bool = false,
+                                     tensor: Bool = false, separate: Bool = false) -> (y: Float, flat: Float, detail: Float, w: Float) {
         let Y = t.y, a1 = t.a1, d1 = t.d1, a2 = t.a2
         let lo = min(Y, min(a1.min(), d1.min())), hi = max(Y, max(a1.max(), d1.max()))
         let span = hi - lo
@@ -386,7 +416,7 @@ extension ClarityMath {
         for v in g { jxx += v.x * v.x; jyy += v.y * v.y; jxy += v.x * v.y }
         jxx *= 0.25; jyy *= 0.25; jxy *= 0.25
         let tr = jxx + jyy
-        let coh = ((jxx - jyy) * (jxx - jyy) + 4 * jxy * jxy).squareRoot() / (tr + 1.024)
+        let coh = min(1, ((jxx - jyy) * (jxx - jyy) + 4 * jxy * jxy).squareRoot() / (tr + 1.024))
         let T = mb.rangeT
         // Range weight r(d) = saturate(2 - |d| / T): 1 up to T, 0 from 2T.
         func r(_ q: SIMD4<Float>) -> SIMD4<Float> {
@@ -415,15 +445,67 @@ extension ClarityMath {
         let strongEdge = coh * smoothstep(18, 42, span)
         let spikeGate = 1 - smoothstep(5, 14, abs(fine) - 2 * abs(mid))
         let toneGuard = smoothstep(110, 200, Y) * (1 - smoothstep(720, 840, Y))
-        let sv: Float = (N - Y) * (S - Y) > 0 ? min(abs(N - Y), abs(S - Y)) : 0
-        let sh: Float = (W - Y) * (E - Y) > 0 ? min(abs(W - Y), abs(E - Y)) : 0
+        // Thin-line contrast: both axial neighbours on the same side of the centre.
+        let sv: Float = (N > Y && S > Y) || (N < Y && S < Y) ? min(abs(N - Y), abs(S - Y)) : 0
+        let sh: Float = (W > Y && E > Y) || (W < Y && E < Y) ? min(abs(W - Y), abs(E - Y)) : 0
         let strokeGuard = 1 - smoothstep(10, 24, max(sv, sh))
         let hudGuard: Float = hud ? 0 : 1
-        let gain = textureGate * (1 - strongEdge) * spikeGate * toneGuard * strokeGuard * hudGuard
-        var delta = min(max(gain * (mb.gFine * fine + mb.gMid * mid), -mb.cap), mb.cap)
+        // Texture weight; 0 while the detail gains are off (flat cleanup alone then acts as in v0.2).
+        let gain = mb.active ? textureGate * (1 - strongEdge) * toneGuard * strokeGuard * hudGuard * spikeGate : 0
+        let band = mb.gFine * fine + mb.gMid * mid
         let shadow = 1 - smoothstep(150, 300, Y)
         let cg = flatClean * (1 - smoothstep(2 + 2 * shadow, 4 + 4 * shadow, span)) * hudGuard
-        delta += min(max(cg * (b2 - Y), -1.5), 1.5)
-        return min(max(yIn + delta, lo), hi)
+        let dFlat = min(max(cg * (b2 - Y), -1.5), 1.5)
+        let aFlat: Float, aDetail: Float
+        if separate {
+            aFlat = (1 - gain) * dFlat
+            aDetail = gain * min(max(band, -mb.cap), mb.cap)
+        } else {
+            aFlat = dFlat
+            aDetail = min(max(gain * band, -mb.cap), mb.cap)
+        }
+        return (min(max(yIn + aFlat + aDetail, lo), hi), aFlat, aDetail, gain)
+    }
+
+    /// v0.3 channel headroom: the normalised luma change `dy` added to R'G'B' `base`, kept inside [-min, 1 - max]
+    /// when the base pixel is in gamut (no channel clips on its own, hue kept); out-of-gamut pixels pass as before.
+    public static func headroomDelta(base: SIMD3<Float>, dy: Float) -> Float {
+        let mn = base.min(), mx = base.max()
+        guard mn >= 0, mx <= 1 else { return dy }
+        return min(max(dy, -mn), 1 - mx)
+    }
+
+    /// Stage 2 CPU reference (clarity_cas): centre `c` and its 4 neighbours (up, left, right, down), working signal.
+    /// `correctionGain` scales the bounded luma delta; sharpness 0 or gain 0 return the centre unchanged.
+    public static func cas(c: SIMD3<Float>, a: SIMD3<Float>, b: SIMD3<Float>, e: SIMD3<Float>, g: SIMD3<Float>,
+                           sharpness: Float, noise: Float, knee: Float, limiter: Bool, lumaW: SIMD3<Float>,
+                           correctionGain: Float = 1) -> SIMD3<Float> {
+        if sharpness <= 0 || correctionGain <= 0 { return c }
+        let mn = simd_min(c, simd_min(simd_min(a, b), simd_min(e, g)))
+        let mxc = simd_max(c, simd_max(simd_max(a, b), simd_max(e, g)))
+        if (mxc - mn).max() < 0.04 { return c }                     // flat: same skip as the plain CAS
+        func l(_ v: SIMD3<Float>) -> Float { (v * lumaW).sum() }
+        let lc = l(c), lu = l(a), ll = l(b), lr = l(e), ld = l(g)
+        let lmn = min(lc, min(min(lu, ll), min(lr, ld))), lmx = max(lc, max(max(lu, ll), max(lr, ld)))
+        let rY = lmx - lmn
+        let gr = max(abs(lr - ll), abs(ld - lu)) / (rY + 1e-4)
+        let lx = abs(lr + ll - 2 * lc), ly = abs(ld + lu - 2 * lc)
+        let an = abs(lx - ly) / (lx + ly + 1e-4)
+        let coh = min(max(max(gr, an) * 1.5 - 0.5, 0), 1)
+        let lowC = 1 - smoothstep(0.05, 0.14, rY)
+        var gate = 1 - noise * lowC * (1 - 0.75 * coh)
+        let nz = min(max(abs(0.25 * (lu + ll + lr + ld) - lc) / (rY + 1e-4), 0), 1)
+        gate *= 1 - 0.5 * nz * (limiter ? 1 : 0)
+        let q = simd_min(mn, SIMD3(repeating: 1) - mxc) / simd_max(mxc, SIMD3(repeating: 1e-4))
+        let amp = SIMD3(min(max(q.x, 0), 1).squareRoot(), min(max(q.y, 0), 1).squareRoot(), min(max(q.z, 0), 1).squareRoot())
+        let wgt = amp * (-1 / (8 + (5 - 8) * min(max(sharpness, 0), 1))) * gate
+        let outc = ((a + b + e + g) * wgt + c) / (SIMD3(repeating: 1) + 4 * wgt)
+        if lc < 0.002 { return c }
+        var yN = min(max(l(outc), lc - 0.06), lc + 0.06)            // bounded delta
+        yN = min(max(yN, lmn), lmx)                                  // no overshoot / halo
+        yN = lc + (yN - lc) * correctionGain                          // v0.3: the gain acts on the delta itself
+        let m = c.max()
+        if yN > lc { yN = lc + (yN - lc) * (1 - smoothstep(knee, min(knee + 0.15, 1), m)) }
+        return c * min(yN / lc, 1 / max(m, 1e-4))
     }
 }

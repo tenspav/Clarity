@@ -4,7 +4,7 @@ Clarity makes compressed game streams look closer to the real thing. It cleans u
 
 It works on decoded YCbCr video frames as they come out of the hardware decoder, 8-bit or 10-bit HDR. It needs nothing beyond Apple's own frameworks (Metal and Core Video).
 
-**Current version: v0.2-beta.** It was built for low-latency PS5 Remote Play streaming in the FramePortal app. Its sister project [Motion](https://github.com/tenspav/Motion) does the frame generation.
+**Current version: v0.3-beta.** It was built for low-latency PS5 Remote Play streaming in the FramePortal app. Its sister project [Motion](https://github.com/tenspav/Motion) does the frame generation.
 
 ## What it fixes
 
@@ -21,17 +21,17 @@ On real 1080p HDR gameplay recordings from a PS5 stream, compared with the origi
 
 | Stream | Picture quality, plain decode | With Clarity | Frame-to-frame flicker, plain → Clarity |
 |---|---|---|---|
-| 1080p, 10 Mbps | 43.3 dB | **45.6 dB** | 9.0 → **8.1** |
-| 1080p, 15 Mbps | 44.1 dB | **47.6 dB** | 7.4 → **6.2** |
-| 1080p, 7.5 Mbps (internet) | 42.1 dB | **43.6 dB** | 11.0 → **10.4** |
-| 720p, 4.7 Mbps (internet) | 39.9 dB | **42.1 dB** | 11.6 → **10.4** |
+| 1080p, 10 Mbps | 43.3 dB | **46.0 dB** | 9.0 → **8.0** |
+| 1080p, 15 Mbps | 44.1 dB | **48.2 dB** | 7.4 → **6.1** |
+| 1080p, 7.5 Mbps (internet) | 42.1 dB | **43.8 dB** | 11.0 → **10.3** |
+| 720p, 4.7 Mbps (internet) | 39.9 dB | **42.4 dB** | 11.6 → **10.3** |
 
 GPU time Clarity adds, MacBook Air M2 (median / 95th percentile):
 
 | | Added time |
 |---|---|
-| 1080p, with Motion frame generation and upscaling to 1440p running | **0.88 / 1.23 ms** |
-| 720p, same | **0.42 / 0.60 ms** |
+| 1080p, with Motion frame generation and upscaling to 1440p running | **about 0.9 / 1.3 ms** |
+| 720p, same | **about 0.5 / 0.8 ms** |
 
 The full design is in [CLARITY.md](CLARITY.md). Every experiment, with its numbers, is in [CLARITY_PROGRESS.md](CLARITY_PROGRESS.md).
 
@@ -76,7 +76,8 @@ try clarity.encodeConvert(enc, y: planes.y, c: planes.c, dst: rgb, params: param
 // ... your upscaler here, if any ...
 // 2. Sharpening, at the output size.
 clarity.encodeCAS(enc, src: upscaled, dst: output,
-                  params: ClarityCASParams(sharpness: 0.25 * plan.casGain, noise: plan.casNoise, pq: isHDR, limiter: plan.casLimiter))
+                  params: ClarityCASParams(sharpness: 0.25 * plan.casGain, noise: plan.casNoise, pq: isHDR,
+                                           limiter: plan.casLimiter, correctionGain: plan.correctionGain))
 enc.endEncoding()
 // Keep `planes.refs` alive until the command buffer completes.
 ```

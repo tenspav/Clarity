@@ -6,6 +6,7 @@ Clarity has its own version number, separate from the FramePortal app it ships i
 
 | Clarity | Shipped in FramePortal | Summary |
 |---|---|---|
+| **v0.3-beta** | v1.13.0 | FP16 coherence overflow fixed, CAS gain on the luma delta, flat cleanup separated from detail. Same GPU cost as v0.2. Last pure-Metal tuning pass |
 | **v0.2-beta** | v1.11.0 | Source-resolution mid-band texture recovery + flat cleanup, RCAS noise limiter, CAS ×0.7, received-bitrate Auto, On = full strength on any route |
 | **v0.1-beta** | v1.9.8 | Siting-correct luma-guided chroma, compression-adaptive HDR-safe CAS, WAN de-ringer |
 
@@ -20,16 +21,117 @@ How the numbers are measured (FramePortal's in-app `--bench-clarity` bench; [cla
   - The whole chain (convert → deblock → MetalFX → CAS) is timed with command-buffer `gpuStartTime` / `gpuEndTime`. Legacy, Clarity 1+2 and Clarity 1+2+3 chains are shuffled per frame.
   - `--motion` adds a live Motion FrameGen load (Motion interpolates the same frames on the same GPU between chains).
 
-## Current standing (v0.2-beta)
+## Current standing (v0.3-beta)
 
-| | Off | v0.1-beta | v0.2-beta |
+| | Off | v0.1-beta | v0.2-beta | v0.3-beta |
+|---|---|---|---|---|
+| Y PSNR vs original, 1080p 10.1 Mbps LAN (all / textured / flat) | 43.28 / 46.09 / 56.26 | 45.35 / 46.51 / 56.26 | 45.60 / 46.41 / 56.61 | **45.95 / 46.44 / 56.61** |
+| Detail energy vs original (1.0 = same), 10.1 Mbps | 0.962 | 0.909 | 0.965 | **0.967** |
+| Added flicker RMS, 10.1 Mbps (codes) | 9.01 | 8.17 | 8.14 | **8.03** |
+| Clarity GPU time, 1080p + Motion, p50 / p95 | | 0.27 / 0.59 ms | 0.88 / 1.23 ms (gate 1.50) | same as v0.2 (paired +0.00 to +0.02 ms p50) |
+
+**Verdict (v0.3):** a small, consistent step on the numbers at the same cost: Y PSNR +0.16 to +0.63 dB, flicker −0.05 to −0.15 codes and detail energy within ±0.003 on every clip. Almost all of it comes from the CAS gain now acting on the luma delta (0.7, which really sharpens less than v0.2's ×0.7 on the amount). The fidelity metric rewards less sharpening, so part of the PSNR gain is "less CAS" rather than "better CAS"; flicker and detail energy say it is not a loss. Band separation is neutral, and the headroom bound and lazy reads were measured and left off. The overflow fix matters on strong edges and is a correctness fix more than a visible one. No live session A/B yet. **Pure-Metal Clarity tuning is frozen from here.**
+
+**Verdict (v0.2):** v0.2 wins back the fine texture that v0.1 lost (detail energy 0.91 → 0.97, Off's level) and keeps v0.1's noise reduction (flicker and overall PSNR slightly better than v0.1). On textured pixels alone PSNR is 0.03-0.12 dB below v0.1: it adds detail that is close to the original's, but not identical. The visible change is modest: crisper foliage and asphalt grain at 1080p, cleaner sky and flat walls, nothing else moves. Inside the 1.50 ms p95 gate in every final run with Motion.
+
+---
+
+## v0.3-beta: audit fixes, CAS delta gain, band separation (last pure-Metal pass)
+
+Source: an independent audit of v0.2. One focused pass; after it the hand-tuned Metal stages are frozen (bug fixes only). Bench: FramePortal's in-app `--bench-clarity CLIP --v02` (v0.3 columns).
+
+### What changed
+
+- **FP16 overflow in the Stage 4 structure tensor (real).** The audit's claim checked numerically (float16 emulation over all 512 extreme 3×3 patterns): even with the 1/64 pre-scale, `(jxx − jyy)² + 4 jxy²` reaches 1,044,484 over the full code range and 561,750 on a legal 64 → 940 edge; half tops out at 65,504. 308 of 512 full-range patterns overflow, the first at a 512-code step (724 for a straight edge). Coherence then became infinite, so `1 − strongEdge` went to −∞ and the gain to ±∞ or NaN: on large mid-tone steps the delta jumped to ±cap instead of being gated off (the 3×3 clamp limited the damage). Fixed: half gradients, float tensor and coherence (`invTrace`, `length(float2(xx − yy, 2 xy)) × invTrace`, saturated). The stroke guard uses same-sign comparisons instead of products.
+- **CAS gain on the luma delta.** New `ClarityCASParams.correctionGain` (struct 48 bytes) scales the bounded, range-clamped luma delta. The plan moves the 0.7 from the sharpness amount (`casGain`, now 1) to `correctionGain`. Sharpness 0 or gain 0 return the pixel unchanged. CPU reference: `ClarityMath.cas`.
+- **Flat cleanup separated from detail** (function constant 47): `Yout = Yin + mix(dFlat, clamp(band, ±cap), w)`; v0.2 added `clamp(w · band, ±cap) + dFlat`. CPU reference: `ClarityMath.midbandDeltas`.
+- **Instrumentation:** function constant 48 writes the de-ring, flat and detail deltas and `w`; `--deltas` reports them.
+- **R'G'B' headroom bound** (function constant 49) and **lazy radius-2 reads** (50): built, measured, not shipped (below).
+- `ClarityPlan.enabled` now includes `flatClean`. `ClarityEngine.convertPSO` is lock-guarded and the shipped variants compile on a background thread at start. A threadgroup-height knob for the sweep.
+- **Static-HUD rects: not wired.** Motion's static-HUD state is a per-cell GPU buffer private to Motion, not rectangles; feeding `ClarityController.hudRects` from it would mean changing Motion. Still open.
+- `ClarityVersion` 0.3-beta. `ClarityPlan.v02()` keeps the v0.2 plan for the A/B.
+
+### Footage
+
+The v0.2 set (1080p30 HDR original at 18.6 Mbps with 10.1 / 14.6 Mbps LAN and 7.5 Mbps WAN re-encodes; 720p 4.7 Mbps WAN against a 40 Mbps 720p reference), plus a 20 s section of the 1080p60 drive recording (asphalt, foliage, shadows, minimap and nav card) re-encoded at 9.3 Mbps against a 53 Mbps re-encode of the same section. Quality on 11 frames (10 on the drive), +1 each for flicker. Test copies only, not in the repository.
+
+### correctionGain: 0.7 vs v0.2's apparent sharpening
+
+`--cas-match` on the 10.1 Mbps clip (CAS 0.25, stream resolution), RMS of the CAS luma change: v0.2 (amount ×0.7, full delta) 2.68 codes; v0.3 with the full amount and the delta ×0.5 / 0.7 / 0.9 / 0.95 / 1.0: 1.40 / 1.96 / 2.52 / 2.66 / 2.80 codes. **0.95 reproduces v0.2's sharpening**; v0.2's ×0.7 on the amount was a ×0.96 on the delta.
+
+### Quality A/B
+
+Y PSNR all / textured / flat (dB) | detail energy, corr | added flicker RMS (codes). "v0.3 @0.95" is v0.3 with the delta gain matched to v0.2.
+
+| Clip | v0.2 | v0.3 @0.95 | **v0.3 (shipped, 0.7)** |
 |---|---|---|---|
-| Y PSNR vs original, 1080p 10.1 Mbps LAN (all / textured / flat) | 43.28 / 46.09 / 56.26 | 45.35 / 46.51 / 56.26 | **45.60** / 46.41 / **56.61** |
-| Detail energy vs original (1.0 = same), 10.1 Mbps | 0.962 | 0.909 | **0.965** |
-| Added flicker RMS, 10.1 Mbps (codes) | 9.01 | 8.17 | **8.14** |
-| Clarity GPU time, 1080p + Motion, p50 / p95 | | 0.27 / 0.59 ms | 0.88 / 1.23 ms (gate 1.50) |
+| 1080p 10.1 Mbps LAN | 45.60 / 46.41 / 56.61, 0.965 / 0.901, 8.138 | 45.61 / 46.41 / 56.61, 0.965 / 0.901, 8.133 | **45.95 / 46.44 / 56.61, 0.967 / 0.902, 8.033** |
+| 1080p 14.6 Mbps LAN | 47.56 / 48.74 / 57.85, 0.987 / 0.939, 6.217 | 47.58 / 48.74 / 57.85, 0.987 / 0.939, 6.211 | **48.19 / 48.77 / 57.85, 0.989 / 0.940, 6.066** |
+| 1080p 7.5 Mbps WAN | 43.58 / 44.32 / 55.08, 0.889 / 0.853, 10.363 | 43.59 / 44.32 / 55.08, 0.889 / 0.853, 10.359 | **43.77 / 44.34 / 55.08, 0.890 / 0.854, 10.290** |
+| 720p 4.7 Mbps WAN | 42.09 / 44.15 / 54.49, 0.950 / 0.850, 10.402 | 42.12 / 44.15 / 54.48, 0.950 / 0.850, 10.388 | **42.36 / 44.18 / 54.48, 0.949 / 0.851, 10.289** |
+| 1080p60 drive, 9.3 Mbps LAN | 45.03 / 45.20 / 53.73, 0.930 / 0.871, 9.028 | 45.03 / 45.20 / 53.73, 0.930 / 0.871, 9.026 | **45.19 / 45.21 / 53.73, 0.933 / 0.872, 8.974** |
 
-**Verdict:** v0.2 wins back the fine texture that v0.1 lost (detail energy 0.91 → 0.97, Off's level) and keeps v0.1's noise reduction (flicker and overall PSNR slightly better than v0.1). On textured pixels alone PSNR is 0.03-0.12 dB below v0.1: it adds detail that is close to the original's, but not identical. The visible change is modest: crisper foliage and asphalt grain at 1080p, cleaner sky and flat walls, nothing else moves. Inside the 1.50 ms p95 gate in every final run with Motion.
+Off and v0.1 are unchanged from the v0.2 entry (the v0.2 column reproduces its numbers exactly). The drive clip: Off 43.81 / 45.04 / 53.53, 0.922, 9.457; v0.1 44.91 / 45.27 / 53.53, 0.876, 9.002.
+
+Feature ablations (v0.3 with one feature flipped, same runs; 10.1 Mbps, 720p, drive):
+- **Band separation off:** within ±0.01 dB, ±0.001 detail energy and ±0.001 flicker on every clip. Neutral. The parts (`--deltas`) show why: on textured pixels the applied flat cleanup drops from 0.065 to 0.053 codes RMS (drive 0.032 → 0.024); detail (0.76 codes RMS on textured) and de-ring are unchanged. Kept on: it costs nothing and flat cleanup no longer acts where detail is restored.
+- **Headroom bound on:** identical numbers on every clip; `--selfcheck` finds 0-1 of the sampled pixels changed (the PQ clips have almost no in-gamut pixels near a channel limit that Stage 3/4 moves). **Off by default** (it costs time, below).
+- **correctionGain:** 0.7 beats 0.95 on Y PSNR (+0.16 to +0.61 dB), flicker (−0.05 to −0.15) on every clip, with detail energy within 0.003 (+0.002 to +0.003, 720p −0.001); **0.7 ships.** Caveat: the fidelity metric compares against the original without CAS, so less sharpening scores higher there. The flicker and detail-energy columns, which do not favour softness, also do not get worse.
+
+### Correctness (`--selfcheck`, final build)
+
+- v0.2 checks as before: direct vs plain-read 0.0001 code, GPU vs CPU 0.005 code max (10.1 Mbps), 0.006 (720p), 0.005 (drive).
+- v0.3: band separation GPU vs CPU 0.005 / 0.006 / 0.005 code; the deltas output against `ClarityMath.midbandDeltas` 0.006-0.010 code.
+- Lazy vs eager radius-2 reads: 0.0000 on both 1080p clips, 0.0034 code on 720p (instruction order inside the fast-math kernel); lazy is not shipped.
+- The all-half tensor (bench) measured 0.02-0.05 code GPU vs CPU, against 0.005 for float.
+
+### GPU time
+
+`--batch 10`, 3 runs × 150 frames per bench, output 2560×1440, CAS 0.25, Motion FrameGen load (Motion v0.5 default settings), ms p50 / p95. Each bench times v0.2 and v0.3 kernels interleaved per frame (rotating order), so "v0.3 − v0.2 convert" is paired. Each configuration was repeated 3 times, alternating with the main-branch build (whose v0.2 kernel is the original v0.2 source). The machine had background load (browser, Tailscale, about 1-2 cores); repeat 1 was quiet, repeats 2-3 were not.
+
+v0.3 conversion vs the v0.2 conversion, paired, p50 (final build, three repeats):
+
+| Clip | repeat 1 | 2 | 3 |
+|---|---|---|---|
+| 1080p 18.6 Mbps + Motion | +0.002 | +0.017 | +0.007 |
+| 1080p 10.1 Mbps + Motion | +0.003 | +0.010 | +0.019 |
+| 720p 4.7 Mbps WAN + Motion | +0.003 | −0.001 | −0.001 |
+
+Clarity total ((convert − legacy) + (CAS − legacy CAS)), p50 / p95:
+
+| Clip, repeat | main build (original v0.2) | v0.3 build: v0.2 | v0.3 build: **v0.3** |
+|---|---|---|---|
+| 1080p 18.6 Mbps, 1 (quiet) | 0.87 / 1.15 | 0.99 / 1.27 | **0.97 / 1.35** |
+| 1080p 18.6 Mbps, 2 | 1.42 / 2.10 | 1.70 / 2.39 | 1.82 / 2.29 |
+| 1080p 18.6 Mbps, 3 | 1.43 / 1.84 | 1.39 / 1.78 | 1.39 / 1.94 |
+| 1080p 10.1 Mbps, 1 | 1.18 / 1.59 | 1.09 / 1.40 | **1.07 / 1.50** |
+| 1080p 10.1 Mbps, 2 | 1.26 / 1.68 | 1.43 / 1.82 | 1.40 / 2.02 |
+| 1080p 10.1 Mbps, 3 | 1.33 / 1.73 | 1.39 / 1.75 | 1.40 / 1.89 |
+| 720p 4.7 Mbps WAN, 1 | 0.54 / 0.77 | 0.64 / 0.84 | **0.65 / 0.90** |
+| 720p 4.7 Mbps WAN, 2 | 0.67 / 0.90 | 0.75 / 0.98 | 0.74 / 0.96 |
+| 720p 4.7 Mbps WAN, 3 | 0.62 / 0.85 | 0.69 / 0.90 | 0.68 / 0.91 |
+
+Spread between repeats: ±0.3 ms p50 and ±0.5 ms p95 at 1080p, set by the background load, far more than any v0.3 − v0.2 difference. The total's p95 is the p95 of a per-frame sum of two noisy paired differences, so it swings more than the convert-only pairing (the CAS kernel is identical in v0.2 and v0.3).
+
+Speed items:
+- **First build** (float tensor, band separation, headroom on, lazy reads on): +0.07 to +0.10 ms p50 over v0.2 at 1080p, +0.03 at 720p (3 repeats each). The two items below explain it, and both are off in the final build.
+- **Lazy radius-2 reads:** paired +0.030 to +0.049 ms p50 at 1080p, +0.014 to +0.015 at 720p (3 repeats each), so slower than plain reads: a SIMD group waits for its slowest lane, and the extra 3×3 logic costs more than four cached reads. Off.
+- **Headroom bound:** paired +0.01 to +0.08 ms p50 (12 runs). Off.
+- **Float vs all-half tensor:** the half form was 0.006 to 0.014 ms p50 *slower* (4 runs). Float ships.
+- **Band separation:** +0.001 to +0.005 ms p50. On.
+- **Threadgroup shape** (`--tg-sweep`, 300 frames, Motion): 32 × 4 / × 8 / × 32 within 0.01 ms p50 for both v0.2 and v0.3 at 1080p and 720p. The maximum stays.
+
+Gates:
+- **v0.3 total ≤ v0.2 total:** met as parity (paired convert +0.00 to +0.02 ms p50). The audit's 0.7-0.8 ms target was not reached: neither the lazy reads nor the threadgroup shape speed up this kernel.
+- **p95 ≤ 1.50 ms with Motion:** met in the quiet repeat at 1080p 10.1 Mbps (1.50) and at 720p; 1.35 ms at 1080p 18.6 Mbps quiet. Under background load both v0.2 and v0.3 went over the gate together (1.7-2.4 ms). It needs a re-run on a quiet machine before the live A/B.
+- **No quality regression vs v0.2:** met (above).
+
+### Still to do
+
+- Re-measure GPU time on a quiet machine with Motion v0.5 (the gate runs here were under background load).
+- Live A/B on real LAN and WAN sessions with a perf trace, before the beta tag comes off.
+- Feed `ClarityController.hudRects` (needs an exported rectangle form of Motion's static-HUD mask).
+- Pure-Metal tuning is frozen: the next quality step is the learned residual below.
 
 ---
 
@@ -195,7 +297,7 @@ Overall: a real but small step. The most visible change is that v0.2 no longer l
 
 ## Roadmap
 
-- **v0.2-beta** (this entry): live A/B, then drop the beta tag.
+- **v0.3-beta**: last pure-Metal pass; live A/B, then drop the beta tag.
 - **Clarity v1.0 Path B, after the trip:** a learned luma residual on the Neural Engine. `ClarityLuma1x-Packed8` is a CoreML model of about 1,172 parameters that runs on the ANE and predicts a small luma residual at source resolution from packed 8-pixel inputs, replacing the hand-tuned Stages 3 and 4. Targets: the same zero-latency slot, GPU time near v0.1's (the ANE does the work), trained and validated on PS5 captures at the received bitrates measured above.
 
 ---

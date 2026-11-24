@@ -119,7 +119,8 @@ while i < count, let sample = output.copyNextSampleBuffer(), let pb = CMSampleBu
                                                    fullRange: false, tenBit: pl.tenBit),
                               siting: ChromaSiting(buffer: pb), tenBit: pl.tenBit, plan: plan)
     let casPlain = ClarityCASParams(sharpness: sharp, noise: 0, pq: isPQ)
-    let casClarity = ClarityCASParams(sharpness: sharp * plan.casGain, noise: plan.casNoise, pq: isPQ, limiter: plan.casLimiter)
+    let casClarity = ClarityCASParams(sharpness: sharp * plan.casGain, noise: plan.casNoise, pq: isPQ, limiter: plan.casLimiter,
+                                      correctionGain: plan.correctionGain)
 
     // Baseline: plain conversion (no guided chroma, no luma stage) + plain CAS. Clarity: its conversion + its CAS.
     let t0 = try await timed { try engine.encodeConvert($0, y: pl.y, c: pl.c, dst: tex[0], params: plain, variant: ClarityEngine.Variant(guided: false)) }

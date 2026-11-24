@@ -5,10 +5,10 @@ import CoreVideo
 /// Clarity GPU side (CLARITY.md). No extra pass and no extra frame of latency:
 ///   1. siting-correct, luma-guided chroma reconstruction  } fused into the stream-res YCbCr -> R'G'B' pass
 ///   3. de-ringer on display luma (raw planes untouched)    }   (`clarity_yuv_rgb`, replaces `yuv_rgb`)
-///   4. v0.2 mid-band enhancer + flat cleanup (13 taps)     }   one luma stage on the same taps
+///   4. mid-band enhancer + flat cleanup (13 taps)          }   one luma stage on the same taps
 ///   2. compression-adaptive, HDR-safe CAS with an RCAS-style noise limiter -> same 5 taps as CAS (`clarity_cas`,
 ///      used by `clarity_cas_sharpen` and the fused present pass)
-/// The source is self-contained (own include, `clarity_` prefixes, function constants 40-45) so it is prepended to
+/// The source is self-contained (own include, `clarity_` prefixes, function constants 40-51) so it is prepended to
 /// a host renderer's own shader source and shares its library.
 public enum ClarityShaders {
     public static let source = """
@@ -23,6 +23,11 @@ public enum ClarityShaders {
     constant bool clarity_tensor [[function_constant(44)]];   // v0.2 A/B: structure-tensor direction weights
     constant bool clarity_linear [[function_constant(45)]];   // bench A/B: write linear light (PQ EOTF here)
     constant bool clarity_wide   [[function_constant(46)]];   // v0.2: B2 = 25-tap [1,2,2,2,1]^2 (5x5) instead of 13 taps
+    constant bool clarity_sep    [[function_constant(47)]];   // v0.3: texture weight picks flat cleanup vs detail (else v0.2 sum)
+    constant bool clarity_deltas [[function_constant(48)]];   // bench: write the luma-stage deltas (de-ring, flat, detail, w)
+    constant bool clarity_headroom [[function_constant(49)]]; // keep the luma change inside the RGB channel headroom (off: no measured gain)
+    constant bool clarity_lazy   [[function_constant(50)]];   // read the radius-2 taps only where they matter (bench: slower)
+    constant bool clarity_h16    [[function_constant(51)]];   // bench: scaled-half structure tensor instead of float
 
     // 128 bytes. First 8 floats = the plain YCbCr -> RGB parameters (YUVCoefficients).
     struct ClarityYUVParams {
@@ -75,43 +80,101 @@ public enum ClarityShaders {
 
     inline bool clarity_in(float2 q, float4 r) { return q.x >= r.x && q.y >= r.y && q.x < r.z && q.y < r.w; }
 
-    // v0.2 mid-band enhancer + flat cleanup (code steps). Y: original centre; a1 = (N, S, W, E) at r1, d1 =
+    // Mid-band enhancer + flat cleanup (code steps). Y: original centre; a1 = (N, S, W, E) at r1, d1 =
     // (NW, NE, SW, SE), a2 = (NN, SS, WW, EE) at r2. yIn: luma after the de-ringer. Two range-weighted blurs
     // B1 (centre 4, A1 2, D1 1) and B2; fine = Y - B1, mid = B1 - B2. Gated off on flat patches, strong coherent
     // edges, isolated spikes, deep shadows / highlights, thin strokes and HUD rects. Never leaves the 3x3 min / max.
     // B2: 13 taps (centre 4, A1 2, D1 2, A2 1), or with clarity_wide the 5x5 [1,2,2,2,1] x [1,2,2,2,1] blur; k1 =
     // (+-2, +-1), k2 = (+-1, +-2), k3 = (+-2, +-2), each ordered (-,-), (+,-), (-,+), (+,+).
-    // Half precision on differences to the centre (|d| <= 1023 is exact; the tensor runs on d / 32 so its squares fit).
+    // Half precision on differences to the centre (|d| <= 1023 is exact); the structure tensor runs in float.
     // Range weight: r(d) = saturate(2 - |d| / T) (1 up to T, 0 from 2T).
     inline half4 clarity_rw(half4 d, half invT) { return saturate(2.0h - fabs(d) * invT); }
 
-    inline float clarity_midband(float yIn, float Yf, float4 a1f, float4 d1f, float4 a2f, float4 k1f, float4 k2f, float4 k3f,
-                                 float2 pos, constant ClarityYUVParams &p) {
+    // Stage 4, first half: everything the central 3x3 decides (span, coherence, guards, B1). The radius-2 taps are only
+    // needed when clarity_needs_r2 says so (with clarity_lazy they are not even read otherwise).
+    struct ClarityMB3 {
+        half4 a1, d1, ra1, rd1;
+        half lo, hi, span, invT, vA1, vD1, sA1, sD1, B1;
+        half gNoSpike;   // detail gain without the spike gate (which needs B2)
+        half cg;         // flat-cleanup weight
+        half dv, dh;     // tensor weights of the axial taps (1 without clarity_tensor)
+    };
+
+    inline ClarityMB3 clarity_midband3(float Yf, float4 a1f, float4 d1f, float2 pos, constant ClarityYUVParams &p) {
+        ClarityMB3 m;
         half4 a1 = half4(a1f - Yf), d1 = half4(d1f - Yf);
-        half lo = min(0.0h, min(min(min(a1.x, a1.y), min(a1.z, a1.w)), min(min(d1.x, d1.y), min(d1.z, d1.w))));
-        half hi = max(0.0h, max(max(max(a1.x, a1.y), max(a1.z, a1.w)), max(max(d1.x, d1.y), max(d1.z, d1.w))));
-        half span = hi - lo;
+        m.a1 = a1; m.d1 = d1;
+        m.lo = min(0.0h, min(min(min(a1.x, a1.y), min(a1.z, a1.w)), min(min(d1.x, d1.y), min(d1.z, d1.w))));
+        m.hi = max(0.0h, max(max(max(a1.x, a1.y), max(a1.z, a1.w)), max(max(d1.x, d1.y), max(d1.z, d1.w))));
+        half span = m.hi - m.lo;
+        m.span = span;
         // Structure tensor over the four 2x2 cells (a b / c d) of the central 3x3: g = 0.5 (b + d - a - c, c + d - a - b).
-        half4 A = a1 * 0.015625h, D = d1 * 0.015625h;   // 0.5 / 32
-        half N = A.x, S = A.y, W = A.z, E = A.w, NW = D.x, NE = D.y, SW = D.z, SE = D.w;
-        half4 gx = half4(N - NW - W, NE + E - N, S - W - SW, E + SE - S);
-        half4 gy = half4(W - NW - N, E - N - NE, SW + S - W, S + SE - E);
-        half jxx = dot(gx, gx) * 0.25h, jyy = dot(gy, gy) * 0.25h, jxy = dot(gx, gy) * 0.25h;
-        half tr = jxx + jyy;
-        half coh = sqrt((jxx - jyy) * (jxx - jyy) + 4.0h * jxy * jxy) / (tr + 0.001h);
-        half invT = half(1.0 / p.rangeT);
-        half4 ra1 = clarity_rw(a1, invT), rd1 = clarity_rw(d1, invT);
-        half4 a2 = half4(a2f - Yf);
-        half4 ra2 = clarity_rw(a2, invT);
-        if (clarity_tensor) {
-            half k = 0.65h * coh / (tr + 0.001h);
-            half dh = 1.0h - k * jxx, dv = 1.0h - k * jyy, dd = 1.0h - k * 0.5h * (tr + 2.0h * jxy), da = 1.0h - k * 0.5h * (tr - 2.0h * jxy);
-            ra1 *= half4(dv, dv, dh, dh); rd1 *= half4(dd, da, da, dd); ra2 *= half4(dv, dv, dh, dh);
+        // v0.2 squared half gradients: (jxx - jyy)^2 + 4 jxy^2 overflowed from a 512-code step on. Shipped: the
+        // gradients in half (|g| <= 32 after the 1/64 scale), the tensor and the coherence in float. clarity_h16 (bench):
+        // all half with a 1/512 scale (|g| <= 4, radicand <= 1280); measured no faster.
+        half coh;
+        float xx = 0.0f, yy = 0.0f, xy = 0.0f, invTrace = 0.0f;
+        if (!clarity_h16 || clarity_tensor) {
+            half4 A = a1 * 0.015625h, D = d1 * 0.015625h;   // 0.5 / 32
+            half N = A.x, S = A.y, W = A.z, E = A.w, NW = D.x, NE = D.y, SW = D.z, SE = D.w;
+            float4 gx = float4(half4(N - NW - W, NE + E - N, S - W - SW, E + SE - S));
+            float4 gy = float4(half4(W - NW - N, E - N - NE, SW + S - W, S + SE - E));
+            xx = dot(gx, gx) * 0.25f; yy = dot(gy, gy) * 0.25f; xy = dot(gx, gy) * 0.25f;
+            invTrace = 1.0f / (xx + yy + 0.001f);
+            coh = half(saturate(length(float2(xx - yy, 2.0f * xy)) * invTrace));
+        } else {
+            half4 A = a1 * 0.001953125h, D = d1 * 0.001953125h;   // 0.5 / 256
+            half N = A.x, S = A.y, W = A.z, E = A.w, NW = D.x, NE = D.y, SW = D.z, SE = D.w;
+            half4 gx = half4(N - NW - W, NE + E - N, S - W - SW, E + SE - S);
+            half4 gy = half4(W - NW - N, E - N - NE, SW + S - W, S + SE - E);
+            half hxx = dot(gx, gx) * 0.25h, hyy = dot(gy, gy) * 0.25h, hxy = dot(gx, gy) * 0.25h;
+            coh = saturate(length(half2(hxx - hyy, 2.0h * hxy)) / (hxx + hyy + 1.5625e-5h));   // eps = 1.024 / 256^2
         }
+        half invT = half(1.0 / p.rangeT);
+        m.invT = invT;
+        half4 ra1 = clarity_rw(a1, invT), rd1 = clarity_rw(d1, invT);
+        m.dv = 1.0h; m.dh = 1.0h;
+        if (clarity_tensor) {
+            float k = 0.65f * float(coh) * invTrace, tr = xx + yy;
+            half dh = half(1.0f - k * xx), dv = half(1.0f - k * yy);
+            half dd = half(1.0f - k * 0.5f * (tr + 2.0f * xy)), da = half(1.0f - k * 0.5f * (tr - 2.0f * xy));
+            ra1 *= half4(dv, dv, dh, dh); rd1 *= half4(dd, da, da, dd);
+            m.dv = dv; m.dh = dh;
+        }
+        m.ra1 = ra1; m.rd1 = rd1;
         const half4 one = half4(1.0h);
-        half vA1 = dot(ra1, a1), vD1 = dot(rd1, d1), vA2 = dot(ra2, a2);
-        half sA1 = dot(ra1, one), sD1 = dot(rd1, one), sA2 = dot(ra2, one);
-        half B1 = (2.0h * vA1 + vD1) / (4.0h + 2.0h * sA1 + sD1);          // B1 - Y
+        m.vA1 = dot(ra1, a1); m.vD1 = dot(rd1, d1);
+        m.sA1 = dot(ra1, one); m.sD1 = dot(rd1, one);
+        m.B1 = (2.0h * m.vA1 + m.vD1) / (4.0h + 2.0h * m.sA1 + m.sD1);   // B1 - Y
+        half textureGate = smoothstep(3.0h, 9.0h, span);
+        half strongEdge = coh * smoothstep(18.0h, 42.0h, span);
+        half Y = half(Yf);
+        half toneGuard = smoothstep(110.0h, 200.0h, Y) * (1.0h - smoothstep(720.0h, 840.0h, Y));
+        // Thin-line contrast: both axial neighbours on the same side of the centre (comparisons, no products).
+        half sv = ((a1.x > 0.0h && a1.y > 0.0h) || (a1.x < 0.0h && a1.y < 0.0h)) ? min(fabs(a1.x), fabs(a1.y)) : 0.0h;
+        half sh = ((a1.z > 0.0h && a1.w > 0.0h) || (a1.z < 0.0h && a1.w < 0.0h)) ? min(fabs(a1.z), fabs(a1.w)) : 0.0h;
+        half strokeGuard = 1.0h - smoothstep(10.0h, 24.0h, max(sv, sh));
+        half hudGuard = (clarity_in(pos, p.hud0) || clarity_in(pos, p.hud1)) ? 0.0h : 1.0h;
+        bool detail = p.gFine > 0.0 || p.gMid > 0.0;
+        m.gNoSpike = detail ? textureGate * (1.0h - strongEdge) * toneGuard * strokeGuard * hudGuard : 0.0h;
+        // Flat cleanup: blocks and steps of a few codes in flat areas (wider in shadows) eased toward B2.
+        half shadow = 1.0h - smoothstep(150.0h, 300.0h, Y);
+        m.cg = half(p.flatClean) * (1.0h - smoothstep(2.0h + 2.0h * shadow, 4.0h + 4.0h * shadow, span)) * hudGuard;
+        return m;
+    }
+
+    // The radius-2 taps change the result only where the detail gain or the flat cleanup is non-zero.
+    inline bool clarity_needs_r2(thread const ClarityMB3 &m) { return m.gNoSpike > 0.0h || m.cg > 0.0h; }
+
+    // Stage 4, second half: B2, the bands and the output. dbg = (de-ring, flat, detail, w) deltas as applied (codes).
+    inline float clarity_midband(float yIn, float Yf, thread const ClarityMB3 &m, float4 a2f, float4 k1f, float4 k2f, float4 k3f,
+                                 constant ClarityYUVParams &p, thread float4 &dbg) {
+        const half4 one = half4(1.0h);
+        half invT = m.invT;
+        half4 a2 = half4(a2f - Yf);
+        half4 ra2 = clarity_rw(a2, invT) * half4(m.dv, m.dv, m.dh, m.dh);
+        half vA2 = dot(ra2, a2), sA2 = dot(ra2, one);
+        half vA1 = m.vA1, vD1 = m.vD1, sA1 = m.sA1, sD1 = m.sD1;
         half B2;                                                           // B2 - Y
         if (clarity_wide) {
             half4 k1 = half4(k1f - Yf), k2 = half4(k2f - Yf), k3 = half4(k3f - Yf);
@@ -121,32 +184,35 @@ public enum ClarityShaders {
         } else {
             B2 = (2.0h * (vA1 + vD1) + vA2) / (4.0h + 2.0h * (sA1 + sD1) + sA2);
         }
-        half fine = -B1, mid = B1 - B2;
-        half textureGate = smoothstep(3.0h, 9.0h, span);
-        half strongEdge = coh * smoothstep(18.0h, 42.0h, span);
+        half fine = -m.B1, mid = m.B1 - B2;
         half spikeGate = 1.0h - smoothstep(5.0h, 14.0h, fabs(fine) - 2.0h * fabs(mid));
-        half Y = half(Yf);
-        half toneGuard = smoothstep(110.0h, 200.0h, Y) * (1.0h - smoothstep(720.0h, 840.0h, Y));
-        half sv = a1.x * a1.y > 0.0h ? min(fabs(a1.x), fabs(a1.y)) : 0.0h;
-        half sh = a1.z * a1.w > 0.0h ? min(fabs(a1.z), fabs(a1.w)) : 0.0h;
-        half strokeGuard = 1.0h - smoothstep(10.0h, 24.0h, max(sv, sh));
-        half hudGuard = (clarity_in(pos, p.hud0) || clarity_in(pos, p.hud1)) ? 0.0h : 1.0h;
-        half gain = textureGate * (1.0h - strongEdge) * spikeGate * toneGuard * strokeGuard * hudGuard;
+        half gain = m.gNoSpike * spikeGate;
         half cap = half(p.cap);
-        half delta = clamp(gain * (half(p.gFine) * fine + half(p.gMid) * mid), -cap, cap);
-        // Flat cleanup: blocks and steps of a few codes in flat areas (wider in shadows) eased toward B2.
-        half shadow = 1.0h - smoothstep(150.0h, 300.0h, Y);
-        half cg = half(p.flatClean) * (1.0h - smoothstep(2.0h + 2.0h * shadow, 4.0h + 4.0h * shadow, span)) * hudGuard;
-        delta += clamp(cg * B2, -1.5h, 1.5h);
-        return clamp(yIn + float(delta), Yf + float(lo), Yf + float(hi));
+        half band = half(p.gFine) * fine + half(p.gMid) * mid;
+        half dFlat = clamp(m.cg * B2, -1.5h, 1.5h);
+        half aFlat, aDetail;
+        if (clarity_sep) {
+            // v0.3: texture weight w picks between the flat cleanup and the (unweighted, capped) detail delta:
+            // dOut = mix(dDering + dFlat, dDering + dDetail, w).
+            half dDetail = clamp(band, -cap, cap);
+            aFlat = (1.0h - gain) * dFlat; aDetail = gain * dDetail;
+        } else {
+            aFlat = dFlat; aDetail = clamp(gain * band, -cap, cap);
+        }
+        if (clarity_deltas) dbg = float4(yIn - Yf, float(aFlat), float(aDetail), float(gain));
+        return clamp(yIn + float(aFlat + aDetail), Yf + float(m.lo), Yf + float(m.hi));
     }
 
-    // Luma stage on the taps (de-ringer, then mid-band on the original taps).
+    // Luma stage on given taps (tile kernel): de-ringer, then the mid-band on the original taps.
     inline float clarity_luma(float Yc, float4 a1, float4 d1, float4 a2, float4 k1, float4 k2, float4 k3, float2 pos,
-                              constant ClarityYUVParams &p) {
+                              constant ClarityYUVParams &p, thread float4 &dbg) {
         float yD = Yc;
         if (clarity_dering && p.deringStrength > 0.0) yD = clarity_dering_core(Yc, a1.x, a1.y, a1.w, a1.z, p);
-        if (clarity_mid) yD = clarity_midband(yD, Yc, a1, d1, a2, k1, k2, k3, pos, p);
+        dbg = float4(yD - Yc, 0.0, 0.0, 0.0);
+        if (clarity_mid) {
+            ClarityMB3 m = clarity_midband3(Yc, a1, d1, pos, p);
+            yD = clarity_midband(yD, Yc, m, a2, k1, k2, k3, p, dbg);
+        }
         return yD;
     }
 
@@ -155,11 +221,26 @@ public enum ClarityShaders {
         return pow(max(q - 0.8359375, 0.0) / (18.8515625 - 18.6875 * q), 1.0 / 0.1593017578125);
     }
 
-    inline void clarity_out(texture2d<float, access::write> dst, uint2 at, float yDisp, float2 C, constant ClarityYUVParams &p) {
+    // yDisp / yOrig: display / original luma (normalised samples). dbg: the luma-stage deltas (clarity_deltas only).
+    inline void clarity_out(texture2d<float, access::write> dst, uint2 at, float yDisp, float yOrig, float2 C, constant ClarityYUVParams &p,
+                            float4 dbg) {
+        if (clarity_deltas) { dst.write(dbg, at); return; }
         if (clarity_raw) { dst.write(float4(yDisp * p.codeScale, C * p.codeScale, 1.0), at); return; }
         float y = (yDisp - p.yOff) * p.yScale;
         float2 c = (C - p.cOff) * p.cScale;
-        float3 rgb = saturate(float3(y + p.rCr * c.y, y - p.gCb * c.x - p.gCr * c.y, y + p.bCb * c.x));
+        float3 rgb;
+        if (clarity_headroom) {
+            // v0.3: the luma change adds equally to R', G', B'. On an in-gamut pixel it is kept inside the channel
+            // headroom [-min, 1 - max], so a saturated colour is not clipped in one channel (no hue shift).
+            float y0 = (yOrig - p.yOff) * p.yScale;
+            float3 base = float3(y0 + p.rCr * c.y, y0 - p.gCb * c.x - p.gCr * c.y, y0 + p.bCb * c.x);
+            float bmn = min(base.r, min(base.g, base.b)), bmx = max(base.r, max(base.g, base.b));
+            float dy = y - y0;
+            if (bmn >= 0.0 && bmx <= 1.0) dy = clamp(dy, -bmn, 1.0 - bmx);
+            rgb = saturate(base + dy);
+        } else {
+            rgb = saturate(float3(y + p.rCr * c.y, y - p.gCb * c.x - p.gCr * c.y, y + p.bCb * c.x));
+        }
         if (clarity_linear) rgb = clarity_pq_decode(rgb) * (10000.0 / 203.0);   // BT.2020 linear, 1.0 = 203 nits
         dst.write(float4(rgb, 1.0), at);
     }
@@ -173,6 +254,30 @@ public enum ClarityShaders {
                     clarity_ld(t, c + int2(-1, 2), mx, K), clarity_ld(t, c + int2(1, 2), mx, K));
         k3 = float4(clarity_ld(t, c + int2(-2, -2), mx, K), clarity_ld(t, c + int2(2, -2), mx, K),
                     clarity_ld(t, c + int2(-2, 2), mx, K), clarity_ld(t, c + int2(2, 2), mx, K));
+    }
+
+    // Luma stage read from the texture (direct and reference kernels). The 3x3 comes first; with clarity_lazy the
+    // radius-2 taps are read only where they can change the result (clarity_needs_r2), else they stand at the centre.
+    inline float clarity_luma_tex(texture2d<float> yT, int2 c, int2 mx, float K, float Yc, constant ClarityYUVParams &p,
+                                  thread float4 &dbg) {
+        float4 a1 = float4(clarity_ld(yT, c + int2(0, -1), mx, K), clarity_ld(yT, c + int2(0, 1), mx, K),
+                           clarity_ld(yT, c + int2(-1, 0), mx, K), clarity_ld(yT, c + int2(1, 0), mx, K));
+        float yD = Yc;
+        if (clarity_dering && p.deringStrength > 0.0) yD = clarity_dering_core(Yc, a1.x, a1.y, a1.w, a1.z, p);
+        dbg = float4(yD - Yc, 0.0, 0.0, 0.0);
+        if (clarity_mid) {
+            float4 d1 = float4(clarity_ld(yT, c + int2(-1, -1), mx, K), clarity_ld(yT, c + int2(1, -1), mx, K),
+                               clarity_ld(yT, c + int2(-1, 1), mx, K), clarity_ld(yT, c + int2(1, 1), mx, K));
+            ClarityMB3 m = clarity_midband3(Yc, a1, d1, float2(c), p);
+            float4 a2 = float4(Yc), k1 = float4(Yc), k2 = float4(Yc), k3 = float4(Yc);
+            if (!clarity_lazy || clarity_needs_r2(m)) {
+                a2 = float4(clarity_ld(yT, c + int2(0, -2), mx, K), clarity_ld(yT, c + int2(0, 2), mx, K),
+                            clarity_ld(yT, c + int2(-2, 0), mx, K), clarity_ld(yT, c + int2(2, 0), mx, K));
+                if (clarity_wide) clarity_wide_taps(yT, c, mx, K, k1, k2, k3);
+            }
+            yD = clarity_midband(yD, Yc, m, a2, k1, k2, k3, p, dbg);
+        }
+        return yD;
     }
 
     // Stage 1 chroma for pixel gid: gathers of the 2x2 footprint, guided by the ORIGINAL luma at the chroma sites.
@@ -209,7 +314,7 @@ public enum ClarityShaders {
 
     // Replaces a plain yuv_rgb conversion: 420v / x420 -> R'G'B' at stream resolution (before PQ decode and MetalFX).
     // One thread per pixel, direct (cached) reads. Fetches: luma 1, chroma 2 gathers, guided +4 bilinear luma taps,
-    // luma stage +4 (de-ringer) / +12 (mid-band) reads.
+    // luma stage +4 (de-ringer) / +8 (mid-band 3x3) / +4 (radius 2; with clarity_lazy only where needed) reads.
     kernel void clarity_yuv_rgb(texture2d<float> yT [[texture(0)]],
                                 texture2d<float> cT [[texture(1)]],
                                 texture2d<float, access::write> dst [[texture(2)]],
@@ -221,22 +326,12 @@ public enum ClarityShaders {
         float Yc = yT.read(gid).r * K;
         float2 C = clarity_chroma(yT, cT, gid, Yc, p);
         float yD = Yc;
+        float4 dbg = float4(0.0);
         if (clarity_dering || clarity_mid) {
-            int2 c = int2(gid), mx = int2(yT.get_width(), yT.get_height()) - 1;
-            float4 a1 = float4(clarity_ld(yT, c + int2(0, -1), mx, K), clarity_ld(yT, c + int2(0, 1), mx, K),
-                               clarity_ld(yT, c + int2(-1, 0), mx, K), clarity_ld(yT, c + int2(1, 0), mx, K));
-            float4 d1 = float4(0.0), a2 = float4(0.0);
-            if (clarity_mid) {
-                d1 = float4(clarity_ld(yT, c + int2(-1, -1), mx, K), clarity_ld(yT, c + int2(1, -1), mx, K),
-                            clarity_ld(yT, c + int2(-1, 1), mx, K), clarity_ld(yT, c + int2(1, 1), mx, K));
-                a2 = float4(clarity_ld(yT, c + int2(0, -2), mx, K), clarity_ld(yT, c + int2(0, 2), mx, K),
-                            clarity_ld(yT, c + int2(-2, 0), mx, K), clarity_ld(yT, c + int2(2, 0), mx, K));
-            }
-            float4 k1 = float4(0.0), k2 = float4(0.0), k3 = float4(0.0);
-            if (clarity_mid && clarity_wide) clarity_wide_taps(yT, c, mx, K, k1, k2, k3);
-            yD = clarity_luma(Yc, a1, d1, a2, k1, k2, k3, float2(gid), p);
+            int2 mx = int2(yT.get_width(), yT.get_height()) - 1;
+            yD = clarity_luma_tex(yT, int2(gid), mx, K, Yc, p, dbg);
         }
-        clarity_out(dst, gid, yD / K, C, p);
+        clarity_out(dst, gid, yD / K, Yc / K, C, p, dbg);
     }
 
     // A/B form: the 13 luma taps from a 16x16 + 2 px halo threadgroup tile (20x20 FP16 code values = 800 B).
@@ -282,8 +377,9 @@ public enum ClarityShaders {
                                  float(tile[r1 + c0]) + float(tile[r1 + 20 + c0]), float(tile[r1 + c1]) + float(tile[r1 + 20 + c1]));
         }
         float2 C = clarity_chroma(yT, cT, gid, Yc, p, tileL);
-        float yD = clarity_luma(Yc, a1, d1, a2, k1, k2, k3, float2(gid), p);
-        clarity_out(dst, gid, yD / K, C, p);
+        float4 dbg = float4(0.0);
+        float yD = clarity_luma(Yc, a1, d1, a2, k1, k2, k3, float2(gid), p, dbg);
+        clarity_out(dst, gid, yD / K, Yc / K, C, p, dbg);
     }
 
     // Reference form of clarity_yuv_rgb: plain clamped reads instead of gathers (same math). Self-check only.
@@ -313,34 +409,30 @@ public enum ClarityShaders {
             C = clarity_guide(C00, C10, C01, C11, L, b, Yc, p);
         }
         float yD = Yc;
+        float4 dbg = float4(0.0);
         if (clarity_dering || clarity_mid) {
-            int2 c = int2(gid), mx = int2(yT.get_width(), yT.get_height()) - 1;
-            float4 a1 = float4(clarity_ld(yT, c + int2(0, -1), mx, K), clarity_ld(yT, c + int2(0, 1), mx, K),
-                               clarity_ld(yT, c + int2(-1, 0), mx, K), clarity_ld(yT, c + int2(1, 0), mx, K));
-            float4 d1 = float4(clarity_ld(yT, c + int2(-1, -1), mx, K), clarity_ld(yT, c + int2(1, -1), mx, K),
-                               clarity_ld(yT, c + int2(-1, 1), mx, K), clarity_ld(yT, c + int2(1, 1), mx, K));
-            float4 a2 = float4(clarity_ld(yT, c + int2(0, -2), mx, K), clarity_ld(yT, c + int2(0, 2), mx, K),
-                               clarity_ld(yT, c + int2(-2, 0), mx, K), clarity_ld(yT, c + int2(2, 0), mx, K));
-            float4 k1 = float4(0.0), k2 = float4(0.0), k3 = float4(0.0);
-            if (clarity_wide) clarity_wide_taps(yT, c, mx, K, k1, k2, k3);
-            yD = clarity_luma(Yc, a1, d1, a2, k1, k2, k3, float2(gid), p);
+            int2 mx = int2(yT.get_width(), yT.get_height()) - 1;
+            yD = clarity_luma_tex(yT, int2(gid), mx, K, Yc, p, dbg);
         }
-        clarity_out(dst, gid, yD / K, C, p);
+        clarity_out(dst, gid, yD / K, Yc / K, C, p, dbg);
     }
 
-    // Stage 2 parameters (16 bytes + float4).
+    // Stage 2 parameters (48 bytes).
     struct ClarityCASParams {
-        float sharpness;   // CAS amount (SharpnessPreset x plan gain)
+        float sharpness;   // CAS amount (SharpnessPreset x source scale); 0 = no Clarity CAS
         float noise;       // 0 = clean stream (plain CAS strength) ... 1 = low bitrate (noisy flat patches gated)
         float knee;        // signal value where positive deltas start to taper (highlight limit)
         float limiter;     // v0.2: RCAS-style noise limiter, 0 = off, 1 = on
         float4 lumaW;      // luma weights of the working signal (BT.2020 for PQ, BT.709 for SDR)
+        float correctionGain;   // v0.3: multiplier on the bounded luma delta (1 = full CAS, 0 = none)
+        float pad0; float pad1; float pad2;
     };
 
     // Stage 2: CAS on the same 5 taps (c centre, a up, b left, e right, g down), compression-adaptive and HDR-safe:
-    // the sharpened luma delta is bounded, kept inside the local luma range, tapered near the highlight limit and
-    // applied as one ratio to R'G'B' (hue kept, no channel is boosted on its own, none pushed past 1.0).
+    // the sharpened luma delta is bounded, kept inside the local luma range, scaled by correctionGain, tapered near the
+    // highlight limit and applied as one ratio to R'G'B' (hue kept, no channel is boosted on its own, none past 1.0).
     inline float3 clarity_cas(float3 c, float3 a, float3 b, float3 e, float3 g, constant ClarityCASParams &p) {
+        if (p.sharpness <= 0.0 || p.correctionGain <= 0.0) return c;
         float3 mn = min(c, min(min(a, b), min(e, g)));
         float3 mxc = max(c, max(max(a, b), max(e, g)));
         float3 rng = mxc - mn;
@@ -367,6 +459,7 @@ public enum ClarityShaders {
         if (lc < 0.002) return c;
         float yN = clamp(dot(outc, lw), lc - 0.06, lc + 0.06);       // bounded delta
         yN = clamp(yN, lmn, lmx);                                     // no overshoot / halo
+        yN = lc + (yN - lc) * p.correctionGain;                       // v0.3: the gain acts on the delta itself
         float m = max(c.r, max(c.g, c.b));
         if (yN > lc) yN = lc + (yN - lc) * (1.0 - smoothstep(p.knee, min(p.knee + 0.15, 1.0), m));
         float ratio = min(yN / lc, 1.0 / max(m, 1e-4));
@@ -434,17 +527,23 @@ public struct ClarityYUVParams {
     }
 }
 
-/// Swift mirror of `ClarityCASParams` (32 bytes).
+/// Swift mirror of `ClarityCASParams` (48 bytes).
 public struct ClarityCASParams {
     public var sharpness: Float, noise: Float, knee: Float, limiter: Float = 0
     public var lumaW: SIMD4<Float>
+    /// v0.3: multiplier on the bounded luma delta (1 = full CAS). The sharpness amount itself only moves the lobe
+    /// weight between 1/8 and 1/5, so scaling it by 0.7 left about 97 % of the lobe.
+    public var correctionGain: Float = 1
+    public var pad0: Float = 0, pad1: Float = 0, pad2: Float = 0
 
     /// `pq`: the work texture holds PQ / BT.2020 (HDR) instead of SDR R'G'B'. `edrPeak`: live headroom (1 = SDR
     /// screen); the taper starts where the present pass starts its highlight roll-off. `limiter`: v0.2 RCAS noise limiter.
-    public init(sharpness: Float, noise: Float, pq: Bool, edrPeak: Float = 1000 / 203, limiter: Bool = false) {
+    /// `correctionGain`: v0.3 gain on the bounded luma delta (ClarityPlan.correctionGain).
+    public init(sharpness: Float, noise: Float, pq: Bool, edrPeak: Float = 1000 / 203, limiter: Bool = false, correctionGain: Float = 1) {
         self.sharpness = sharpness
         self.noise = noise
         self.limiter = limiter ? 1 : 0
+        self.correctionGain = correctionGain
         lumaW = pq ? SIMD4(0.2627, 0.6780, 0.0593, 0) : SIMD4(0.2126, 0.7152, 0.0722, 0)
         if pq {
             // to_edr rolls off from 0.75 * peak (linear, 1.0 = 203 nits): the PQ code of that level.
@@ -473,19 +572,46 @@ public final class ClarityEngine {
         public var wide = false
         /// Plain-read reference kernel (4 chroma reads, no gather) instead of the production kernel. Self-check only.
         public var perPixel = false
+        /// v0.3: the texture weight picks between flat cleanup and detail (off = the v0.2 sum of both).
+        public var separate = false
+        /// Bench: write the luma-stage deltas (de-ring, flat, detail, w) in code steps instead of a colour.
+        public var deltas = false
+        /// Keep the luma change inside the R'G'B' channel headroom of in-gamut pixels (not shipped: no measured gain).
+        public var headroom = false
+        /// Read the radius-2 taps only where they can change the result (same output, fewer reads). Measured slower
+        /// than reading them always (SIMD divergence), so not shipped.
+        public var lazy = false
+        /// Bench: the all-half structure tensor (1/512 scale) instead of the float one. Measured no faster.
+        public var halfTensor = false
 
         public init(guided: Bool = true, dering: Bool = false, raw: Bool = false, mid: Bool = false, tensor: Bool = false,
-                    linear: Bool = false, tile: Bool = false, wide: Bool = false, perPixel: Bool = false) {
+                    linear: Bool = false, tile: Bool = false, wide: Bool = false, perPixel: Bool = false,
+                    separate: Bool = false, deltas: Bool = false, headroom: Bool = false, lazy: Bool = false,
+                    halfTensor: Bool = false) {
             self.guided = guided; self.dering = dering; self.raw = raw; self.mid = mid; self.tensor = tensor
             self.linear = linear; self.tile = tile; self.wide = wide; self.perPixel = perPixel
+            self.separate = separate; self.deltas = deltas; self.headroom = headroom; self.lazy = lazy
+            self.halfTensor = halfTensor
         }
     }
 
     public let device: MTLDevice
     public let library: MTLLibrary
     public let casPSO: MTLComputePipelineState
+    /// Built on first use (any thread: the render queue, a prewarm thread, a bench), guarded by `psoLock`.
     private var convertPSOs: [Variant: MTLComputePipelineState] = [:]
+    private let psoLock = NSLock()
     private var cache: CVMetalTextureCache?
+    /// Threadgroup height of the conversion dispatch; 0 = maxTotalThreadsPerThreadgroup / threadExecutionWidth.
+    /// Width is always threadExecutionWidth. Bench sweep knob (threadExecutionWidth x 4 / x 8 / max).
+    public var convertThreadgroupHeight = 0
+
+    /// The conversion variants a shipped plan can ask for (`variant(for:)`), compiled ahead of the first frame.
+    public static let shippedVariants: [Variant] = [false, true].flatMap { dering in
+        [false, true].map { mid in
+            Variant(guided: true, dering: dering, mid: mid, separate: mid)
+        }
+    }
 
     public init(device: MTLDevice, library: MTLLibrary? = nil) throws {
         self.device = device
@@ -498,22 +624,28 @@ public final class ClarityEngine {
         CVMetalTextureCacheCreate(nil, nil, device, nil, &cache)
     }
 
+    /// Compiles the shipped conversion variants off the calling thread, so the first frames do not wait on a compile.
+    public func prewarm() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            for v in Self.shippedVariants { _ = try? self?.convertPSO(v) }
+        }
+    }
+
+    /// Thread-safe. The compile runs outside the lock; two threads asking for the same new variant at once may both
+    /// compile it, and the first one stored wins.
     public func convertPSO(_ v: Variant) throws -> MTLComputePipelineState {
-        if let p = convertPSOs[v] { return p }
+        if let p = psoLock.withLock({ convertPSOs[v] }) { return p }
         let cv = MTLFunctionConstantValues()
-        var g = v.guided, d = v.dering, r = v.raw, m = v.mid, t = v.tensor, l = v.linear, wd = v.wide
-        cv.setConstantValue(&g, type: .bool, index: 40)
-        cv.setConstantValue(&d, type: .bool, index: 41)
-        cv.setConstantValue(&r, type: .bool, index: 42)
-        cv.setConstantValue(&m, type: .bool, index: 43)
-        cv.setConstantValue(&t, type: .bool, index: 44)
-        cv.setConstantValue(&l, type: .bool, index: 45)
-        cv.setConstantValue(&wd, type: .bool, index: 46)
+        var flags = [v.guided, v.dering, v.raw, v.mid, v.tensor, v.linear, v.wide, v.separate, v.deltas, v.headroom, v.lazy, v.halfTensor]
+        for i in flags.indices { cv.setConstantValue(&flags[i], type: .bool, index: 40 + i) }
         let name = v.perPixel ? "clarity_yuv_rgb_px" : v.tile ? "clarity_yuv_rgb_tile" : "clarity_yuv_rgb"
         let fn = try library.makeFunction(name: name, constantValues: cv)
         let p = try device.makeComputePipelineState(function: fn)
-        convertPSOs[v] = p
-        return p
+        return psoLock.withLock {
+            if let q = convertPSOs[v] { return q }
+            convertPSOs[v] = p
+            return p
+        }
     }
 
     /// Plane textures of a 420v / 420f / x420 / xf20 buffer. Keep `refs` alive until the GPU is done.
@@ -541,12 +673,15 @@ public final class ClarityEngine {
         return ClarityYUVParams(k, siting: siting ?? ChromaSiting(buffer: pb), tenBit: tenBit, deringStrength: deringStrength)
     }
 
-    /// The conversion variant a plan needs (production kernel).
-    public static func variant(for plan: ClarityPlan) -> Variant {
+    /// The conversion variant a plan needs (production kernel). `lazy`: read the radius-2 taps only where needed
+    /// (same output; bench A/B only, slower than the plain reads).
+    public static func variant(for plan: ClarityPlan, lazy: Bool = false) -> Variant {
         let mid = plan.midband.active || plan.flatClean > 0
         // Direct reads: with the 13-tap B2 they are 0.03-0.07 ms faster than the 16x16 tile (the tile only wins with the
         // 25-tap B2, which is not shipped). CLARITY_PROGRESS.md › v0.2-beta.
-        return Variant(guided: plan.chroma, dering: plan.deringStrength > 0, mid: mid, tile: false, wide: false)
+        return Variant(guided: plan.chroma, dering: plan.deringStrength > 0, mid: mid, tile: false, wide: false,
+                       separate: mid && plan.separateBands, headroom: (mid || plan.deringStrength > 0) && plan.rgbHeadroom,
+                       lazy: mid && lazy)
     }
 
     /// `dst` has the luma plane's size.
@@ -563,7 +698,7 @@ public final class ClarityEngine {
             enc.dispatchThreadgroups(MTLSize(width: (dst.width + 15) / 16, height: (dst.height + 15) / 16, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
         } else {
-            Self.dispatch(enc, pso, dst)
+            Self.dispatch(enc, pso, dst, rows: convertThreadgroupHeight)
         }
     }
 
@@ -576,8 +711,10 @@ public final class ClarityEngine {
         Self.dispatch(enc, casPSO, dst)
     }
 
-    public static func dispatch(_ enc: MTLComputeCommandEncoder, _ pso: MTLComputePipelineState, _ dst: MTLTexture) {
-        let w = pso.threadExecutionWidth, h = max(1, pso.maxTotalThreadsPerThreadgroup / w)
+    /// Threadgroups of threadExecutionWidth x `rows` (0 = as many rows as the pipeline allows).
+    public static func dispatch(_ enc: MTLComputeCommandEncoder, _ pso: MTLComputePipelineState, _ dst: MTLTexture, rows: Int = 0) {
+        let w = pso.threadExecutionWidth, mx = max(1, pso.maxTotalThreadsPerThreadgroup / w)
+        let h = rows > 0 ? min(rows, mx) : mx
         enc.dispatchThreads(MTLSize(width: dst.width, height: dst.height, depth: 1), threadsPerThreadgroup: MTLSize(width: w, height: h, depth: 1))
     }
 

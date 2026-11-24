@@ -2,7 +2,9 @@
 
 Clarity is a compression cleanup and chroma reconstruction engine for Apple silicon, built for the FramePortal PS5 Remote Play app. It makes a 10-45 Mbps 10-bit HEVC HDR stream from the PS5 look closer to the console's own picture, with **no extra frame of latency** and a GPU budget of **1.50 ms p95** (v0.2; v0.1 had 1.0 ms) on a MacBook Air M2, with Motion FrameGen and MetalFX running.
 
-**Current version: Clarity v0.2-beta.** Clarity is versioned separately from the app (like [Motion](https://github.com/tenspav/Motion)). Modes: **Auto / Off / On** (`ClarityMode`).
+**Current version: Clarity v0.3-beta.** Clarity is versioned separately from the app (like [Motion](https://github.com/tenspav/Motion)). Modes: **Auto / Off / On** (`ClarityMode`).
+
+**Pure-Metal tuning is frozen after v0.3.** The hand-tuned shader stages get bug fixes only; the next quality step is the learned residual (Roadmap in CLARITY_PROGRESS.md).
 
 Engineering log and benchmark history: [CLARITY_PROGRESS.md](CLARITY_PROGRESS.md).
 
@@ -18,7 +20,7 @@ Clarity fixes what it safely can, inside passes the renderer already runs:
 1. **Colour that follows the edges (Stage 1).** When colour is rebuilt for a pixel, the four nearby colour samples are weighted by how similar their brightness is to this pixel's brightness. A pixel on the bright side of an edge takes its colour from the bright side. This also reads exactly where the colour samples sit on the grid (the stream says so), instead of assuming it.
 2. **Sharpening that knows about compression (Stage 2).** At low bitrates the sharpening steps back on faint, noisy patches and keeps full strength on real edges. In HDR it sharpens brightness only, by scaling the colour as a whole, so bright highlights never turn into coloured fringes.
 3. **A gentle de-ringer (Stage 3).** On low-bitrate sessions, tiny ripples next to edges are nudged toward their neighbours by at most 2 of 1023 steps. Real edges and texture are left alone. It is off on a clean, high-bitrate stream.
-4. **Texture recovery and flat cleanup (Stage 4, v0.2).** Compression smears medium-sized texture (leaves, asphalt grain, brickwork) more than it smears edges. At the source resolution, before upscaling, Clarity lifts that mid-sized detail back where the picture is already textured, and leaves edges, thin lines, text, very dark and very bright areas alone. In flat areas (sky, walls, dark shadows) it does the opposite and eases small compression blocks and steps toward their neighbours. Because detail is restored here, the sharpening after upscaling runs at 70 % so the two do not stack.
+4. **Texture recovery and flat cleanup (Stage 4, v0.2).** Compression smears medium-sized texture (leaves, asphalt grain, brickwork) more than it smears edges. At the source resolution, before upscaling, Clarity lifts that mid-sized detail back where the picture is already textured, and leaves edges, thin lines, text, very dark and very bright areas alone. In flat areas (sky, walls, dark shadows) it does the opposite and eases small compression blocks and steps toward their neighbours. Because detail is restored here, the sharpening after upscaling keeps 70 % of its change so the two do not stack.
 
 What Clarity does not do: no film grain, no fixed 8×8 deblocking grid, no AI upscaling, no extra frame of delay.
 
@@ -26,8 +28,8 @@ What Clarity does not do: no film grain, no fixed 8×8 deblocking grid, no AI up
 
 | Mode | Stage 1 (chroma) | Stage 2 (adaptive CAS) | Stage 3 (de-ringer) | Stage 4 (mid-band + flat clean) |
 |---|---|---|---|---|
-| **Auto** (default) | on | on, ×0.7, noise limiter scaled by received bitrate | any route, scaled by received bitrate | any route; gains ×(0.5 + 0.5 × eligibility), flat clean × eligibility |
-| **On** | on | on, ×0.7, full noise limiter | full strength | full strength, home LAN and away |
+| **Auto** (default) | on | on, delta ×0.7, noise limiter scaled by received bitrate | any route, scaled by received bitrate | any route; gains ×(0.5 + 0.5 × eligibility), flat clean × eligibility |
+| **On** | on | on, delta ×0.7, full noise limiter | full strength | full strength, home LAN and away |
 | **Off** | plain bilinear (the pre-Clarity path) | plain CAS | off | off |
 
 "WAN" is any route that is not the home LAN (over the internet). The route picks the Stage 4 preset (below); in v0.2 it no longer switches stages on or off.
@@ -74,7 +76,7 @@ PS5 HEVC 10-bit ──► VideoToolbox ──► x420 planes (Y 16-bit unorm, Cb
 | `Sources/Clarity/YUVCoefficients.swift` | YCbCr → R'G'B' matrix and range coefficients |
 | `Sources/clarity-bench/main.swift` | Standalone GPU-cost bench with before / after PNGs |
 
-The Metal source has its own include, `clarity_` names and function constants 40-46 (40 guided, 41 dering, 42 raw, 43 mid-band, 44 structure tensor (bench only), 45 linear FP16 output (bench only), 46 wide B2 (bench only)). It is prepended to the renderer's shader source, so both live in one library.
+The Metal source has its own include, `clarity_` names and function constants 40-51 (40 guided, 41 dering, 42 raw, 43 mid-band, 44 structure tensor (bench only), 45 linear FP16 output (bench only), 46 wide B2 (bench only), 47 v0.3 band separation, 48 luma-stage deltas output (bench only), 49 R'G'B' headroom bound (off), 50 lazy radius-2 reads (bench only), 51 all-half structure tensor (bench only)). It is prepended to the renderer's shader source, so both live in one library. `ClarityEngine` builds its pipelines behind a lock and compiles the shipped variants on a background thread at start (`prewarm`).
 
 ## Shader math
 
@@ -135,7 +137,7 @@ Same 5 taps as the existing CAS (centre c, up, left, right, down), no new reads.
 
   A clean stream (noise 0) gets exactly the plain CAS strength. A low-bitrate stream stops sharpening faint, incoherent patches and keeps coherent edges.
 - **RCAS noise limiter (v0.2).** From the same 5 taps: `nz = saturate(|mean(N, W, E, S) − c| / rY)`, `gate × (1 − 0.5 × nz × limiter)`. A lone pixel that sticks out of its cross (a compression speck) is sharpened half as much.
-- **Gain (v0.2).** While Stage 4 runs, the CAS amount is × 0.7 (`casGainWithMidband`), so detail is not boosted twice.
+- **Gain (v0.3).** While Stage 4 runs, the bounded luma delta is × 0.7 (`ClarityPlan.correctionGain`), so detail is not boosted twice. v0.2 multiplied the sharpness amount instead, but the amount only moves the CAS lobe weight between 1/8 and 1/5: ×0.7 kept about 97 % of the lobe (95 % of the delta). A gain of 0.95 on the delta matches v0.2's change (RMS 2.66 vs 2.68 codes); 0.7 measured better (CLARITY_PROGRESS.md › v0.3-beta). Sharpness 0 or gain 0 return the pixel unchanged.
 - **HDR / EDR safety.** The CAS result is reduced to a luma delta, bounded to ±0.06 of signal, clamped to the local luma min / max (no halo), and positive deltas taper to zero as the brightest channel approaches the highlight knee (the PQ level where the present pass starts its roll-off: 0.75 × EDR peak). The pixel is then scaled as a whole: `RGB × (Ynew / Y)`, capped so no channel passes 1.0. No channel is boosted on its own, so saturated HDR colours keep their hue.
 
 ### Stage 3: CDEF-inspired de-ringer (WAN)
@@ -164,9 +166,9 @@ strength = 0.4 × eligibility    (Auto: any route; On: 0.4)
 
 For 1080p30: 0.30 bpp ≈ 18.7 Mbps, 0.70 bpp ≈ 43.5 Mbps received. The same eligibility drives Stage 2's `noise` and Stage 4's strength.
 
-### Stage 4: source-resolution mid-band enhancer and flat cleanup (v0.2)
+### Stage 4: source-resolution mid-band enhancer and flat cleanup (v0.2, v0.3)
 
-Runs on the display luma right after Stage 3, inside the same conversion pass, at stream resolution (before MetalFX). Taps around the centre Y: `A1` = N, S, W, E at radius 1, `D1` = the 4 diagonals, `A2` = NN, SS, WW, EE at radius 2. All maths is half precision on differences to the centre (`|d| ≤ 1023` codes is exact in half).
+Runs on the display luma right after Stage 3, inside the same conversion pass, at stream resolution (before MetalFX). Taps around the centre Y: `A1` = N, S, W, E at radius 1, `D1` = the 4 diagonals, `A2` = NN, SS, WW, EE at radius 2. The maths is half precision on differences to the centre (`|d| ≤ 1023` codes is exact in half), except the structure tensor and its coherence, which run in float from v0.3: in v0.2 `(jxx − jyy)² + 4 jxy²` overflowed half from a 512-code step on (a legal 64 → 940 edge gives 561,750; half tops out at 65,504), so coherence became infinite and the edge gate broke on exactly the strong edges it is for.
 
 ```
 r(d)  = saturate(2 − |d| / T)                       range weight: 1 up to T, 0 from 2T
@@ -180,17 +182,20 @@ textureGate = smoothstep(3, 9, span)                       no boost on flat patc
 strongEdge  = coh × smoothstep(18, 42, span)               no boost on clean, strong edges
 spikeGate   = 1 − smoothstep(5, 14, |fine| − 2 |mid|)       no boost on isolated specks
 toneGuard   = smoothstep(110, 200, Y) × (1 − smoothstep(720, 840, Y))   deep shadows and highlights
-strokeGuard = 1 − smoothstep(10, 24, thin-line contrast)   1-px lines and text strokes (N/S or W/E both on one side)
+strokeGuard = 1 − smoothstep(10, 24, thin-line contrast)   1-px lines and text strokes (N/S or W/E both on one side, by comparison)
 hudGuard    = 0 inside a HUD rect (dilated by 2 px), else 1
-gain  = textureGate (1 − strongEdge) spikeGate toneGuard strokeGuard hudGuard
-delta = clamp(gain (gFine · fine + gMid · mid), ±cap)
+w     = textureGate (1 − strongEdge) spikeGate toneGuard strokeGuard hudGuard      (0 when the gains are 0)
+dDetail = clamp(gFine · fine + gMid · mid, ±cap)
 
 flat clean: shadow = 1 − smoothstep(150, 300, Y)
             cg = flatClean × (1 − smoothstep(2 + 2·shadow, 4 + 4·shadow, span)) × hudGuard
-            delta += clamp(cg × (B2 − Y), ±1.5)
+            dFlat = clamp(cg × (B2 − Y), ±1.5)
 
-Yout = clamp(Yin + delta, min3x3, max3x3)                  never leaves the original 3x3 range: no halo, no overshoot
+v0.3:  Yout = clamp(Yin + mix(dFlat, dDetail, w), min3x3, max3x3)    (Yin = Y + dDering)
+v0.2:  Yout = clamp(Yin + clamp(w (gFine · fine + gMid · mid), ±cap) + dFlat, min3x3, max3x3)
 ```
+
+Yout never leaves the original 3×3 range: no halo, no overshoot. v0.3 makes the texture weight pick between flat cleanup and detail instead of adding both; measured neutral (±0.01 dB), kept because flat cleanup no longer acts on textured pixels.
 
 Presets (`ClarityMidband`; Auto scales `gFine` and `gMid` by `0.5 + 0.5 × eligibility`, On uses them as is):
 
@@ -206,6 +211,12 @@ Deviations from the v0.2 spec, all measured (CLARITY_PROGRESS.md › v0.2-beta):
 - **Structure tensor** (anisotropic weights along edges): measured no gain (within ±0.02 dB and ±0.003 flicker on every clip), so it is not shipped. Function constant 44 keeps it for the bench.
 - **25-tap [1,2,2,2,1]² B2**: more detail energy (1.005 vs 0.965 at 10 Mbps) but lower Y PSNR, more flicker and +0.2-0.3 ms. Not shipped; function constant 46 keeps it for the bench.
 - **Tile vs direct reads**: a 16×16 threadgroup tile (20×20 with halo, guide luma read from the tile) was 0.12-0.16 ms faster than direct reads with the 25-tap B2, but with the shipped 13-tap B2 direct reads are 0.02-0.06 ms faster at p50, so direct reads ship (`clarity_yuv_rgb_tile` stays for the bench).
+
+Measured and not shipped in v0.3 (CLARITY_PROGRESS.md › v0.3-beta):
+- **Lazy radius-2 reads** (read A2 only where the detail gain or the flat cleanup can be non-zero): the same output, but 0.01-0.05 ms slower (SIMD divergence). Function constant 50.
+- **R'G'B' headroom bound** (keep the luma change inside `[−min(RGB), 1 − max(RGB)]` of in-gamut pixels): no measurable change on any clip (0-1 sampled pixels differ), +0.01-0.08 ms. Function constant 49, `ClarityPlan.rgbHeadroom`.
+- **All-half tensor** with a 1/512 scale (no overflow either): no faster than float, and 4-6× the GPU-vs-CPU error. Function constant 51.
+- **Threadgroup shape** (32 × 4 / × 8 / × 32): within 0.01 ms; the maximum stays.
 
 ## HDR and chroma handling
 
@@ -235,7 +246,9 @@ MacBook Air M2, output 2560×1440 MetalFX, CAS 0.25. Per kernel: 10 back-to-back
 | 1080p 18.6 Mbps, no Motion | 0.35 / 0.51 | 1.01 / 1.34 |
 | 720p 4.7 Mbps WAN, Motion FrameGen load | 0.25 / 0.41 | **0.42 / 0.60** |
 
-All under the 1.50 ms p95 gate. The conversion pass is most of it (Stage 4: about +0.6 ms at 1080p); the CAS limiter adds nothing measurable (+0.00 ms vs v0.1 CAS). Without Motion the GPU runs at a lower clock, so every kernel, legacy included, is slower; the gate is set with Motion running, as in a real session.
+All under the 1.50 ms p95 gate in the v0.2 runs.
+
+**v0.3-beta costs the same as v0.2.** Paired per frame in the same run, the v0.3 conversion is +0.002 to +0.019 ms p50 against the v0.2 conversion at 1080p and −0.001 to +0.003 ms at 720p; the CAS kernel is the same. On a quiet machine (the first of three repeats) 1080p 18.6 Mbps with Motion measured 0.87 / 1.15 ms for the v0.2 build and 0.97 / 1.35 ms for v0.3's total. With background load (the other two repeats) both builds measured 1.4 / 1.8-2.4 ms, over the gate together. Full tables: CLARITY_PROGRESS.md › v0.3-beta. The conversion pass is most of it (Stage 4: about +0.6 ms at 1080p); the CAS limiter adds nothing measurable (+0.00 ms vs v0.1 CAS). Without Motion the GPU runs at a lower clock, so every kernel, legacy included, is slower; the gate is set with Motion running, as in a real session.
 
 ## Verification
 

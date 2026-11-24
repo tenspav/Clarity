@@ -92,6 +92,20 @@ swift run -c release clarity-bench your-clip.mp4 --count 300 --png out --frame 6
 
 This times the plain conversion and sharpening against Clarity's on any recording, and writes before / after images of frame 60. Add `--mode auto --bpp 0.2` to try Auto at a given bitrate, `--wan` for the internet presets, and `--8bit` to decode as 8-bit. On a MacBook Air M2 with a 1080p HDR clip it reports about 0.72 / 0.83 ms added (sharpening at 1080p here; the table above sharpens at 1440p).
 
+## Datasets & Credits
+
+Clarity is trained and benchmarked on third-party footage. None of it is included in this repository; get it from the sources below, under the terms set by their authors.
+
+| Dataset | Authors / source | Link | Used for |
+|---|---|---|---|
+| GamingHDRVideoSET | Nabajeet Barman et al. | [github.com/NabajeetBarman/GamingHDRVideoSET](https://github.com/NabajeetBarman/GamingHDRVideoSET) | HDR gameplay: training and evaluation (from v0.6) |
+| KUGVD (Kingston University Gaming Video Dataset) | Nabajeet Barman et al. | [github.com/NabajeetBarman/GamingHDRVideoSET](https://github.com/NabajeetBarman/GamingHDRVideoSET) | Gameplay at several bitrates: training and evaluation (from v0.6) |
+| Netflix Open Content, Chimera | Netflix, hosted by Xiph.org | [media.xiph.org/video/derf/Chimera/](https://media.xiph.org/video/derf/Chimera/) | 4K 10-bit reference video (DrivingPOV, WindAndNature): training and evaluation (from v0.6) |
+
+Thanks to the authors for making this footage available to researchers. If you use Clarity's results in published work, please cite their papers too.
+
+This section is kept up to date whenever footage used for training or benchmarks is added or changed.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

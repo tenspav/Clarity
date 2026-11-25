@@ -1,49 +1,85 @@
-# Clarity
+<p align="center">
+  <img src="assets/icon.svg" width="160" alt="Clarity icon">
+</p>
 
-Clarity makes compressed game streams look closer to the real thing. It cleans up what video compression leaves behind (smeared colour edges, faint ripples next to sharp lines, blocky flat areas) and brings back some of the fine texture the encoder threw away. It runs inside passes a video renderer already has (no extra pass, no extra texture, no Neural Engine) and adds **no extra frame of delay**.
+<h1 align="center">Clarity</h1>
 
-It works on decoded YCbCr video frames as they come out of the hardware decoder, 8-bit or 10-bit HDR. It needs nothing beyond Apple's own frameworks (Metal and Core Video).
+<p align="center">
+  <b>Cleaner, sharper game streams on Apple silicon: pure Metal, zero added frames of delay.</b><br>
+  Fixes what video compression leaves behind, inside passes your renderer already has.
+</p>
 
-**Current version: v1.0** (final pure-Metal release). It was built for low-latency PS5 Remote Play streaming in the FramePortal app. Its sister project [Motion](https://github.com/tenspav/Motion) does the frame generation.
+<p align="center">
+  <img alt="version" src="https://img.shields.io/badge/version-v1.0-2ea44f">
+  <img alt="platform" src="https://img.shields.io/badge/platform-macOS%2026%20%7C%20iOS%2026-lightgrey">
+  <img alt="engine" src="https://img.shields.io/badge/engine-pure%20Metal-orange">
+  <img alt="neural engine" src="https://img.shields.io/badge/Neural%20Engine-0%25-blueviolet">
+  <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
+</p>
+
+---
+
+## At a glance
+
+| | Clarity v1.0 |
+|---|---|
+| ⚡ Conversion kernel (1080p in, 1440p out, M2) | **0.766 ms** p95 (v0.3: 0.891 ms, **−13 %**) |
+| 🎮 Added to the full frame, full strength | **+0.76 ms** p50 / **+0.98 ms** p95 (budget 1.50 ms) |
+| 🌊 Clean high-bitrate stream (25 Mbps, Auto) | **0 ms**: bypass, colour fix only |
+| 🧠 Neural Engine / trained model | **0 %** / none: hand-designed, pure Metal |
+| ⏱️ Extra frames of delay | **0**: no extra pass, no extra texture |
+| 📱 Runs on | Apple silicon Mac (macOS 26), iPhone / iPad (iOS 26) |
+| 🎞️ Input | Decoded YCbCr straight from the hardware decoder, 8-bit or 10-bit HDR |
+
+> **v1.0 milestone (final pure-Metal release):** a smooth Auto strength driven by the bitrate actually received, a clean-stream bypass, one plan per generated frame pair (real and generated frames always match), and a two-pixel conversion kernel that is 0.12 ms faster. Every quality gate still passes (GPU vs CPU reference 0.0000 on all six chroma sitings; seam score 0.447 vs 0.448 in v0.3). Built for low-latency PS5 Remote Play in FramePortal; frame generation is its sister project [Motion](https://github.com/tenspav/Motion).
+
+## Picture quality
+
+Real 1080p HDR gameplay from a PS5 stream, compared with the original high-bitrate picture (higher is better):
+
+| Stream | Plain decode | With Clarity | Flicker, plain → Clarity |
+|---|---|---|---|
+| 1080p, 15 Mbps | 44.1 dB | **48.2 dB** (+4.1) | 7.4 → **6.1** |
+| 1080p, 10 Mbps | 43.3 dB | **46.0 dB** (+2.7) | 9.0 → **8.0** |
+| 1080p, 7.5 Mbps (internet) | 42.1 dB | **43.8 dB** (+1.7) | 11.0 → **10.3** |
+| 720p, 4.7 Mbps (internet) | 39.9 dB | **42.4 dB** (+2.5) | 11.6 → **10.3** |
+
+> Quality was measured with v0.3's stages, which v1.0 keeps unchanged at full strength; v1.0's two-pixel kernel differs only by float rounding (at most 1.2e-6, a 10-bit step is 9.8e-4).
+
+## Speed (MacBook Air M2)
+
+GPU time in FramePortal's real render path: 1080p HDR source, MetalFX upscale to 1440p, Motion frame generation running, measured against the same path without Clarity.
+
+| Kernel / path | p50 | p95 |
+|---|---|---|
+| Conversion, one pixel per thread (v0.3) | 0.879 ms | 0.891 ms |
+| **Conversion, two pixels per thread (v1.0)** | **0.764 ms** | **0.766 ms** |
+| Clarity sharpening (plain sharpening: 0.359 ms) | 0.460 ms | 0.474 ms |
+| **Whole frame, full strength, added** | **+0.76 ms** | **+0.98 ms** |
+| Whole frame, Auto at 25 Mbps (bypass) | **0 ms** | **0 ms** |
 
 ## What it fixes
 
-- **Colour bleeding past edges.** Video stores colour at a quarter of the resolution of brightness. A plain decoder blurs it back up, so red tail lights, coloured map routes and HUD text bleed a pixel or two. Clarity rebuilds the colour so it follows the edges in the picture.
-- **Texture lost at low bitrates.** Leaves, asphalt and brickwork turn to mush when the stream drops to 10-15 Mbps. Clarity lifts that mid-sized detail back where the picture is already textured, and leaves edges, text, deep shadows and bright highlights alone.
-- **Ripples and blocks.** Faint ringing next to edges and small blocks in flat areas (sky, walls, shadows) are eased toward their neighbours.
-- **Sharpening that makes noise worse.** Clarity's sharpening steps back on noisy patches and keeps full strength on real edges. In HDR it never tints bright highlights.
-
-It adds no film grain and no learned or invented detail. Its luma changes are clamped to the range of each pixel's 3×3 neighbourhood and its sharpening to the local luma range, which keeps halos and overshoot small.
-
-## How well it works
-
-On real 1080p HDR gameplay recordings from a PS5 stream, compared with the original high-bitrate picture (higher is better):
-
-| Stream | Picture quality, plain decode | With Clarity | Frame-to-frame flicker, plain → Clarity |
-|---|---|---|---|
-| 1080p, 10 Mbps | 43.3 dB | **46.0 dB** | 9.0 → **8.0** |
-| 1080p, 15 Mbps | 44.1 dB | **48.2 dB** | 7.4 → **6.1** |
-| 1080p, 7.5 Mbps (internet) | 42.1 dB | **43.8 dB** | 11.0 → **10.3** |
-| 720p, 4.7 Mbps (internet) | 39.9 dB | **42.4 dB** | 11.6 → **10.3** |
-
-GPU time Clarity adds in FramePortal's real render path (MacBook Air M2, 1080p HDR source, MetalFX upscale to 1440p, Motion frame generation running, median / 95th percentile, measured against the same path without Clarity):
-
-| | Added time |
+| Problem | What Clarity does |
 |---|---|
-| 1080p, low or medium bitrate (full or partial strength) | **about 0.76 / 0.9-1.0 ms** |
-| 1080p, clean high-bitrate stream (Auto strength 0) | **about 0** |
+| 🎨 Colour bleeding past edges (tail lights, map routes, HUD text) | Rebuilds quarter-resolution colour so it follows the edges in the picture |
+| 🍃 Texture lost at low bitrates (leaves, asphalt, brick) | Lifts mid-sized detail where the picture is already textured; leaves edges, text, shadows and highlights alone |
+| 🧱 Ripples and blocks in flat areas (sky, walls) | Eases them toward their neighbours |
+| ✨ Sharpening that amplifies noise | Steps back on noisy patches, full strength on real edges; never tints HDR highlights |
 
-The quality table above was measured with v0.3's stages, which v1.0 keeps unchanged at full strength. What v1.0 adds is in [CLARITY_PROGRESS.md](CLARITY_PROGRESS.md) › v1.0: a smooth Auto strength, a clean-stream bypass, one plan per generated frame pair, and a faster conversion kernel.
-
-The full design is in [CLARITY.md](CLARITY.md). Every experiment, with its numbers, is in [CLARITY_PROGRESS.md](CLARITY_PROGRESS.md).
+No film grain, no learned or invented detail: luma changes are clamped to each pixel's 3×3 neighbourhood, sharpening to the local luma range.
 
 ## Modes
 
-- **Auto** (recommended): one strength from 0 to 1, set by the bitrate actually received. At 1080p, full strength at or below about 7.8 Mbps (30 FPS source), easing smoothly to zero at about 18.7 Mbps; it warms up over the first second. At zero, a clean stream gets only the colour fix: no luma cleanup and no sharpening.
-- **On**: full strength always.
-- **Off**: the plain conversion, for comparison.
+| Mode | Behaviour |
+|---|---|
+| **Auto** (recommended) | Strength 0 to 1 from the bitrate actually received. At 1080p30: full at ≤ ~7.8 Mbps, easing to 0 at ~18.7 Mbps; warms up over the first second. At 0, a clean stream gets only the colour fix. |
+| **On** | Full strength always. |
+| **Off** | Plain conversion, for comparison. |
 
-If your renderer has its own 8×8 RGB deblocking pass, keep it: Clarity v1.0 does not replace it (a fused source-luma alternative was built and measured, and did not beat it).
+If your renderer has its own 8×8 RGB deblocking pass, keep it: Clarity does not replace it.
+
+Full design: [CLARITY.md](CLARITY.md). Every experiment with its numbers: [CLARITY_PROGRESS.md](CLARITY_PROGRESS.md).
 
 ## Requirements
 
